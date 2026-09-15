@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package enforcer
 
@@ -65,10 +65,10 @@ func NewSELinuxEnforcer(node tp.Node, logger *fd.Feeder) *SELinuxEnforcer {
 
 	// SELinux templates
 	templatePath := homeDir + "/templates"
-	if _, err := os.Stat(filepath.Clean(templatePath + "/install.sh")); err != nil {
+	if _, err := os.Stat(filepath.Clean(templatePath + "/install.sh")); err != nil { //#nosec G703
 		// go test
 		templatePath = os.Getenv("PWD") + "/../templates"
-		if _, err := os.Stat(filepath.Clean(templatePath + "/install.sh")); err != nil {
+		if _, err := os.Stat(filepath.Clean(templatePath + "/install.sh")); err != nil { //#nosec G703
 			se.Logger.Err("Failed to find templates/install.sh")
 			return nil
 		}
@@ -81,7 +81,7 @@ func NewSELinuxEnforcer(node tp.Node, logger *fd.Feeder) *SELinuxEnforcer {
 	}
 
 	// remove old profiles if exists
-	if err = os.RemoveAll(filepath.Clean(cfg.GlobalCfg.SELinuxProfileDir)); err != nil {
+	if err = kl.RemoveAllSafe(filepath.Clean(cfg.GlobalCfg.SELinuxProfileDir)); err != nil {
 		se.Logger.Errf("Failed to remove existing SELinux profiles (%s)", err.Error())
 		return nil
 	}
@@ -293,7 +293,7 @@ func (se *SELinuxEnforcer) InstallSELinuxModulesIfNeeded() bool {
 		return false
 	}
 
-	for _, line := range strings.Split(res, "\n") {
+	for line := range strings.SplitSeq(res, "\n") {
 		// fields: ModuleName Priority Language
 		words := strings.Fields(line)
 
@@ -332,7 +332,7 @@ func (se *SELinuxEnforcer) RestoreSELinuxLabels(profilePath string) bool {
 
 	res := true
 
-	for _, line := range strings.Split(string(profile), "\n") {
+	for line := range strings.SplitSeq(string(profile), "\n") {
 		// fields: SubjectLabel SubjectPath ObjectLabel ObjectPath Permissive Directory Recursive
 
 		words := strings.Fields(line)
@@ -484,7 +484,7 @@ func (se *SELinuxEnforcer) UpdateSELinuxLabels(profilePath string) bool {
 
 	res := true
 
-	for _, line := range strings.Split(string(profile), "\n") {
+	for line := range strings.SplitSeq(string(profile), "\n") {
 		// fields: SubjectLabel SubjectPath ObjectLabel ObjectPath Permissive Directory Recursive
 
 		words := strings.Fields(line)

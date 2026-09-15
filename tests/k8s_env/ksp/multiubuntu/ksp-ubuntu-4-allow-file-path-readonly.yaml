@@ -36,6 +36,14 @@ spec:
     - dir: /pts/
     - dir: /var/lib/
       recursive: true  
+    - dir: /sys/kernel/
+      recursive: true 
+    - dir: /dev/pts/
+      recursive: true
+    - dir: /
+      recursive: true
+      fromSource:
+      - path: /runc 
   action:
     Allow
 

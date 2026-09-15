@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package main is the entrypoint to initializing the armor
 package main
@@ -7,31 +7,42 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/kubearmor/KubeArmor/KubeArmor/buildinfo"
+	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	"github.com/kubearmor/KubeArmor/KubeArmor/core"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 )
 
-// GitCommit represents build-time info for git commit
-var GitCommit string
-
-// GitBranch represents build-time info for git branch
-var GitBranch string
-
-// BuildDate represents build-time info for build date
-var BuildDate string
-
-func printBuildDetails() {
-	if GitCommit == "" {
-		return
-	}
-	kg.Printf("BUILD-INFO: commit: %v, branch: %v, date: %v",
-		GitCommit, GitBranch, BuildDate)
+func init() {
+	buildinfo.PrintBuildDetails()
 }
 
-func init() {
-	printBuildDetails()
+func isKubeArmorBpfMap(name string) bool {
+	return strings.HasPrefix(name, "kubearmor")
+}
+
+func cleanupBpfMaps(bpfMapsDir string, removeFn func(string) error) error {
+	entries, err := os.ReadDir(bpfMapsDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if isKubeArmorBpfMap(entry.Name()) {
+			path := filepath.Join(bpfMapsDir, entry.Name())
+			if err := removeFn(path); err != nil {
+				kg.Errf("Failed to delete BPF map %s: %v", path, err)
+			} else {
+				kg.Warnf("Deleting existing map %s. This indicates previous cleanup failed", path)
+			}
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -44,20 +55,10 @@ func main() {
 	// initial clean up
 
 	bpfMapsDir := "/sys/fs/bpf/"
-	bpfMapsName := []string{"kubearmor_config", "kubearmor_events", "kubearmor_containers", "kubearmor_visibility", "kubearmor_alert_throttle"}
-	for _, mp := range bpfMapsName {
-		path := bpfMapsDir + mp
-		/* This should not be triggered in ideal cases,
-		if this is triggered that means there is incomplete cleanup process
-		from the last installation */
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			err = os.Remove(path)
-			if err != nil {
-				kg.Err(err.Error())
-			}
-			kg.Warnf("Deleteing existing map %s. This means previous cleanup was failed", path)
 
-		}
+	if err := cleanupBpfMaps(bpfMapsDir, kl.RemoveSafe); err != nil {
+		kg.Errf("Failed to read BPF map directory: %v", err)
+		return
 	}
 
 	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))

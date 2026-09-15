@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 # Cleanup function
 cleanup() {
@@ -12,8 +12,10 @@ cleanup() {
   
   docker system prune -a -f
   
-  sudo podman system prune -a -f
-  
+  if command -v podman &> /dev/null; then
+    sudo podman system prune -a -f
+  fi
+
   # rm -rf /home/vagrant/actions-runner/_work/KubeArmor
 
   echo "Cleanup complete."

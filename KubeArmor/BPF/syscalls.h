@@ -1,6 +1,6 @@
 // +build ignore
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright 2023 Authors of KubeArmor */
+/* Copyright 2026 Authors of KubeArmor */
 
 #ifndef __SYSCALLS_H
 #define __SYSCALLS_H
@@ -24,6 +24,7 @@ enum
     _SOCKET_CREATE = 461,
     _SOCKET_CONNECT = 462,
     _SOCKET_ACCEPT = 463,
+    _SOCKET_SENDMSG = 465,
 
     //process
     _SECURITY_BPRM_CHECK = 352,

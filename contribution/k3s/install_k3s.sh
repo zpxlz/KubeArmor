@@ -1,11 +1,12 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 if [ "$RUNTIME" == "" ]; then
-    if [ -S /var/run/docker.sock ]; then
-        RUNTIME="docker"
-    elif [ -S /var/run/crio/crio.sock ]; then
+    # TODO: Enable the support for docker here. Currently docker runtime in k3s env is leading to the issue:
+    # https://github.com/kubearmor/KubeArmor/issues/1971
+    # Once this issue is fixed, we can support docker again in k3s
+    if [ -S /var/run/crio/crio.sock ]; then
         RUNTIME="crio"
     else # default
         RUNTIME="containerd"
@@ -16,17 +17,17 @@ fi
 if [ "$RUNTIME" == "docker" ]; then # docker
     CGROUP_SYSTEMD=$(docker info 2> /dev/null | grep -i cgroup | grep systemd | wc -l)
     if [ $CGROUP_SYSTEMD == 1 ]; then
-        curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik --docker --container-runtime-endpoint unix:///var/run/docker.sock --kubelet-arg cgroup-driver=systemd" sh -
+        curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh && K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik --docker --container-runtime-endpoint unix:///var/run/docker.sock --kubelet-arg cgroup-driver=systemd" sh /tmp/install-k3s.sh -
         [[ $? != 0 ]] && echo "Failed to install k3s" && exit 1
     else # cgroupfs
-        curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik --docker --container-runtime-endpoint unix:///var/run/docker.sock" sh -
+        curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh && K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik --docker --container-runtime-endpoint unix:///var/run/docker.sock" sh /tmp/install-k3s.sh -
         [[ $? != 0 ]] && echo "Failed to install k3s" && exit 1
     fi
 elif [ "$RUNTIME" == "crio" ]; then # cri-o
-  curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik --container-runtime-endpoint unix:///var/run/crio/crio.sock --kubelet-arg cgroup-driver=systemd" sh -
+  curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh && K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik --container-runtime-endpoint unix:///var/run/crio/crio.sock --kubelet-arg cgroup-driver=systemd" sh /tmp/install-k3s.sh -
   [[ $? != 0 ]] && echo "Failed to install k3s" && exit 1
 else # use containerd by default
-  curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik" sh -
+  curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh && K3S_KUBECONFIG_MODE="644" INSTALL_K3S_EXEC="--disable=traefik" sh /tmp/install-k3s.sh -
   [[ $? != 0 ]] && echo "Failed to install k3s" && exit 1
 fi
 
@@ -53,6 +54,7 @@ echo "wait for initialization"
 sleep 15
 
 runtime="15 minute"
+
 endtime=$(date -ud "$runtime" +%s)
 
 while [[ $(date -u +%s) -le $endtime ]]
@@ -63,4 +65,3 @@ do
     sleep 1
 done
 
-kubectl get pods -A

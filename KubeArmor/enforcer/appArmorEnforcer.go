@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package enforcer is responsible for setting up and handling policy updates for supported enforcers including AppArmor, SELinux and BPFLSM
 package enforcer
@@ -114,11 +114,11 @@ profile apparmor-default flags=(attach_disconnected,mediate_deleted) {
 
 	existingProfiles := []string{}
 
-	if pids, err := os.ReadDir(filepath.Clean("/proc")); err == nil {
+	if pids, err := os.ReadDir(filepath.Clean(cfg.GlobalCfg.ProcFsMount)); err == nil {
 		for _, f := range pids {
 			if f.IsDir() {
 				if _, err := strconv.Atoi(f.Name()); err == nil {
-					if content, err := os.ReadFile(filepath.Clean("/proc/" + f.Name() + "/attr/current")); err == nil {
+					if content, err := os.ReadFile(filepath.Clean(cfg.GlobalCfg.ProcFsMount + "/" + f.Name() + "/attr/current")); err == nil {
 						line := strings.Split(string(content), "\n")[0]
 						words := strings.Split(line, " ")
 
@@ -157,7 +157,7 @@ profile apparmor-default flags=(attach_disconnected,mediate_deleted) {
 				continue // still need to check other profiles
 			}
 
-			if err := os.Remove(filepath.Clean("/etc/apparmor.d/" + fileName)); err != nil {
+			if err := kl.RemoveSafe(filepath.Clean("/etc/apparmor.d/" + fileName)); err != nil {
 				ae.Logger.Warnf("Unable to remove /etc/apparmor.d/%s (%s)", fileName, err.Error())
 				continue // still need to check other profiles
 			}
@@ -210,6 +210,13 @@ func (ae *AppArmorEnforcer) RegisterAppArmorProfile(podName, profileName string,
 	ae.AppArmorProfilesLock.Lock()
 	defer ae.AppArmorProfilesLock.Unlock()
 
+	// this path is expected to have a single component "apparmor-profile"
+	// and this is to ensure that the filename has no path separators or parent directory references
+	if strings.Contains(profileName, "/") || strings.Contains(profileName, "\\") || strings.Contains(profileName, "..") {
+		ae.Logger.Warnf("Invalid appArmor profile name (%s)", profileName)
+		return false
+	}
+
 	if _, err := os.Stat(filepath.Clean("/etc/apparmor.d/" + profileName)); err == nil {
 		if content, err := os.ReadFile(filepath.Clean("/etc/apparmor.d/" + profileName)); err != nil {
 			ae.Logger.Warnf("Unable to register the AppArmor profile (%s, %s))", profileName, err.Error())
@@ -230,11 +237,11 @@ func (ae *AppArmorEnforcer) RegisterAppArmorProfile(podName, profileName string,
 	// generate a profile with basic allows if a privileged container
 	var newProfile string
 	if privileged {
-		newProfile = strings.Replace(ae.ApparmorDefaultPrivileged, "apparmor-default", profileName, -1)
+		newProfile = strings.ReplaceAll(ae.ApparmorDefaultPrivileged, "apparmor-default", profileName)
 		ae.AppArmorPrivilegedProfiles[profileName] = struct{}{}
 		ae.Logger.Printf("Added an AppArmor profile for a privileged container (%s, %s)", podName, profileName)
 	} else {
-		newProfile = strings.Replace(ae.ApparmorDefault, "apparmor-default", profileName, -1)
+		newProfile = strings.ReplaceAll(ae.ApparmorDefault, "apparmor-default", profileName)
 	}
 
 	newFile, err := os.Create(filepath.Clean("/etc/apparmor.d/" + profileName))
@@ -291,6 +298,13 @@ func (ae *AppArmorEnforcer) UnregisterAppArmorProfile(podName, profileName strin
 		return false
 	}
 
+	// this path is expected to have a single component "apparmor-profile"
+	// and this is to ensure that the filename has no path separators or parent directory references
+	if strings.Contains(profileName, "/") || strings.Contains(profileName, "\\") || strings.Contains(profileName, "..") {
+		ae.Logger.Warnf("Invalid appArmor profile name (%s)", profileName)
+		return false
+	}
+
 	if _, err := os.Stat(filepath.Clean("/etc/apparmor.d/" + profileName)); err != nil {
 		ae.Logger.Warnf("Unable to find the AppArmor profile (%s, %s)", profileName, err.Error())
 		return false
@@ -306,9 +320,9 @@ func (ae *AppArmorEnforcer) UnregisterAppArmorProfile(podName, profileName strin
 
 	var newProfile string
 	if privileged {
-		newProfile = strings.Replace(ae.ApparmorDefaultPrivileged, "apparmor-default", profileName, -1)
+		newProfile = strings.ReplaceAll(ae.ApparmorDefaultPrivileged, "apparmor-default", profileName)
 	} else {
-		newProfile = strings.Replace(ae.ApparmorDefault, "apparmor-default", profileName, -1)
+		newProfile = strings.ReplaceAll(ae.ApparmorDefault, "apparmor-default", profileName)
 	}
 
 	newFile, err := os.Create(filepath.Clean("/etc/apparmor.d/" + profileName))
@@ -374,6 +388,7 @@ umount,
 signal,
 unix,
 ptrace,
+dbus,
 
 file,
 network,
@@ -439,32 +454,37 @@ func (ae *AppArmorEnforcer) UnregisterAppArmorHostProfile() bool {
 		return true
 	}
 
+	ae.Logger.Printf("Unregistering the KubeArmor host profile from %s", cfg.GlobalCfg.Host)
+
 	ae.AppArmorProfilesLock.Lock()
 	defer ae.AppArmorProfilesLock.Unlock()
 
-	if err := ae.CreateAppArmorHostProfile(); err != nil {
-		ae.Logger.Warnf("Unable to reset the KubeArmor host profile in %s", cfg.GlobalCfg.Host)
+	if err := kl.RunCommandAndWaitWithErr("aa-remove-unknown", []string{}); err != nil {
+		ae.Logger.Warnf("Unable to cleanup the KubeArmor host profile in %s", cfg.GlobalCfg.Host)
 
-		if err := os.Remove(appArmorHostFile); err != nil {
-			ae.Logger.Warnf("Unable to remove the KubeArmor host profile from %s (%s)", cfg.GlobalCfg.Host, err.Error())
+		if err := ae.CreateAppArmorHostProfile(); err != nil {
+			ae.Logger.Warnf("Unable to reset the KubeArmor host profile in %s", cfg.GlobalCfg.Host)
+
+			if err := kl.RemoveSafe(appArmorHostFile); err != nil {
+				ae.Logger.Warnf("Unable to remove the KubeArmor host profile from %s (%s)", cfg.GlobalCfg.Host, err.Error())
+			}
+
+			return false
 		}
 
-		return false
-	}
+		if err := kl.RunCommandAndWaitWithErr("apparmor_parser", []string{"-r", "-W", "-C", appArmorHostFile}); err != nil {
+			ae.Logger.Warnf("Unable to reset the KubeArmor host profile in %s", cfg.GlobalCfg.Host)
 
-	if err := kl.RunCommandAndWaitWithErr("apparmor_parser", []string{"-r", "-W", "-C", appArmorHostFile}); err != nil {
-		ae.Logger.Warnf("Unable to reset the KubeArmor host profile in %s", cfg.GlobalCfg.Host)
+			if err := kl.RemoveSafe(appArmorHostFile); err != nil {
+				ae.Logger.Warnf("Unable to remove the KubeArmor host profile from %s (%s)", cfg.GlobalCfg.Host, err.Error())
+			}
 
-		if err := os.Remove(appArmorHostFile); err != nil {
-			ae.Logger.Warnf("Unable to remove the KubeArmor host profile from %s (%s)", cfg.GlobalCfg.Host, err.Error())
 		}
 
-		return false
-	}
-
-	if err := os.Remove(appArmorHostFile); err != nil {
-		ae.Logger.Warnf("Unable to remove the KubeArmor host profile from %s (%s)", cfg.GlobalCfg.Host, err.Error())
-		return false
+		if err := kl.RemoveSafe(appArmorHostFile); err != nil {
+			ae.Logger.Warnf("Unable to remove the KubeArmor host profile from %s (%s)", cfg.GlobalCfg.Host, err.Error())
+			return false
+		}
 	}
 
 	ae.Logger.Printf("Unregistered the KubeArmor host profile from %s", cfg.GlobalCfg.Host)
@@ -487,6 +507,12 @@ func (ae *AppArmorEnforcer) UpdateAppArmorProfile(endPoint tp.EndPoint, appArmor
 	ae.AppArmorPrivilegedProfilesLock.Unlock()
 
 	if policyCount, newProfile, ok := ae.GenerateAppArmorProfile(appArmorProfile, securityPolicies, endPoint.DefaultPosture, privileged); ok {
+		// this path is expected to have a single component "apparmor-profile"
+		// and this is to ensure that the filename has no path separators or parent directory references
+		if strings.Contains(appArmorProfile, "/") || strings.Contains(appArmorProfile, "\\") || strings.Contains(appArmorProfile, "..") {
+			ae.Logger.Warnf("Invalid AppArmor profile name (%s)", appArmorProfile)
+			return
+		}
 		newfile, err := os.Create(filepath.Clean("/etc/apparmor.d/" + appArmorProfile))
 		if err != nil {
 			ae.Logger.Warnf("Unable to open an AppArmor profile (%s, %s)", appArmorProfile, err.Error())
@@ -522,13 +548,16 @@ func (ae *AppArmorEnforcer) UpdateAppArmorProfile(endPoint tp.EndPoint, appArmor
 			ae.Logger.Warnf("Unable to update %d security rule(s) to %s/%s/%s (%s)", policyCount, endPoint.NamespaceName, endPoint.EndPointName, appArmorProfile, err.Error())
 			return
 		}
-		if err := kl.RunCommandAndWaitWithErr("aa-disable", []string{"/etc/apparmor.d/" + appArmorProfile}); err != nil {
-			ae.Logger.Warnf("Unable to disable for a weird issue %d security rule(s) to %s/%s/%s (%s)", policyCount, endPoint.NamespaceName, endPoint.EndPointName, appArmorProfile, err.Error())
-			return
-		}
-		if err := kl.RunCommandAndWaitWithErr("aa-enforce", []string{"/etc/apparmor.d/" + appArmorProfile}); err != nil {
-			ae.Logger.Warnf("Unable to enforce back for a weird issue %d security rule(s) to %s/%s/%s (%s)", policyCount, endPoint.NamespaceName, endPoint.EndPointName, appArmorProfile, err.Error())
-			return
+
+		if cfg.GlobalCfg.K8sEnv {
+			if err := kl.RunCommandAndWaitWithErr("aa-disable", []string{"/etc/apparmor.d/" + appArmorProfile}); err != nil {
+				ae.Logger.Warnf("Unable to disable for a weird issue %d security rule(s) to %s/%s/%s (%s)", policyCount, endPoint.NamespaceName, endPoint.EndPointName, appArmorProfile, err.Error())
+				return
+			}
+			if err := kl.RunCommandAndWaitWithErr("aa-enforce", []string{"/etc/apparmor.d/" + appArmorProfile}); err != nil {
+				ae.Logger.Warnf("Unable to enforce back for a weird issue %d security rule(s) to %s/%s/%s (%s)", policyCount, endPoint.NamespaceName, endPoint.EndPointName, appArmorProfile, err.Error())
+				return
+			}
 		}
 
 		ae.Logger.Printf("Updated %d security rule(s) to %s/%s/%s", policyCount, endPoint.NamespaceName, endPoint.EndPointName, appArmorProfile)
@@ -579,7 +608,30 @@ func (ae *AppArmorEnforcer) UpdateAppArmorHostProfile(secPolicies []tp.HostSecur
 		CapabilitiesAction: cfg.GlobalCfg.HostDefaultCapabilitiesPosture,
 	}
 
-	if policyCount, newProfile, ok := ae.GenerateAppArmorHostProfile(secPolicies, globalDefaultPosture); ok {
+	var hostPolicies []tp.SecurityPolicy
+
+	// Typecast HostSecurityPolicy spec to normal SecurityPolicies
+	for _, secPolicy := range secPolicies {
+		var hostPolicy tp.SecurityPolicy
+		if err := kl.Clone(secPolicy.Spec.Process, &hostPolicy.Spec.Process); err != nil {
+			ae.Logger.Warnf("Error cloning host policy spec process to sec policy construct")
+		}
+		if err := kl.Clone(secPolicy.Spec.File, &hostPolicy.Spec.File); err != nil {
+			ae.Logger.Warnf("Error cloning host policy spec file to sec policy construct")
+		}
+		if err := kl.Clone(secPolicy.Spec.Network, &hostPolicy.Spec.Network); err != nil {
+			ae.Logger.Warnf("Error cloning host policy spec network to sec policy construct")
+		}
+		if err := kl.Clone(secPolicy.Spec.Capabilities, &hostPolicy.Spec.Capabilities); err != nil {
+			ae.Logger.Warnf("Error cloning host policy spec capabilities to sec policy construct")
+		}
+		if err := kl.Clone(secPolicy.Spec.Syscalls, &hostPolicy.Spec.Syscalls); err != nil {
+			ae.Logger.Warnf("Error cloning host policy spec syscall to sec policy construct")
+		}
+		hostPolicies = append(hostPolicies, hostPolicy)
+	}
+
+	if policyCount, newProfile, ok := ae.GenerateAppArmorProfile("kubearmor.host /{usr/,}bin/*sh", hostPolicies, globalDefaultPosture, true); ok {
 		newfile, err := os.Create(filepath.Clean(appArmorHostFile))
 		if err != nil {
 			ae.Logger.Warnf("Unable to open the KubeArmor host profile in %s (%s)", cfg.GlobalCfg.Host, err.Error())
@@ -619,6 +671,8 @@ func (ae *AppArmorEnforcer) UpdateAppArmorHostProfile(secPolicies []tp.HostSecur
 		ae.Logger.Printf("Updated %d host security rules to the KubeArmor host profile in %s", policyCount, cfg.GlobalCfg.Host)
 
 		ae.ClearKubeArmorHostFile(appArmorHostFile)
+	} else if newProfile != "" {
+		ae.Logger.Errf("Error Generating %s AppArmor profile: %s", appArmorHostFile, newProfile)
 	}
 }
 

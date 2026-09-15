@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package util contains helper functions needed by unit tests
 package util
@@ -7,6 +7,7 @@ package util
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -66,7 +67,6 @@ func KarmorGetTargetLogs(timeout time.Duration, target *pb.Log) (EventResult, er
 			if evtin.Type == "Log" {
 				protojson.Unmarshal(evtin.Data, &logItem)
 				res.Logs = append(res.Logs, &logItem)
-				// fmt.Printf("Log: %s\n", &logItem)
 			} else if evtin.Type != "Alert" {
 				log.Errorf("UNKNOWN EVT type %s", evtin.Type)
 			}
@@ -93,7 +93,6 @@ func KarmorGetTargetLogs(timeout time.Duration, target *pb.Log) (EventResult, er
 }
 
 func getAlertWithInfo(alert *pb.Alert, target *pb.Alert) bool {
-
 	if target.PolicyName != "" {
 		if alert.PolicyName != target.PolicyName {
 			return false
@@ -124,6 +123,11 @@ func getAlertWithInfo(alert *pb.Alert, target *pb.Alert) bool {
 			return false
 		}
 	}
+	if target.Source != "" {
+		if !strings.Contains(alert.Source, target.Source) {
+			return false
+		}
+	}
 	if target.NamespaceName != "" {
 		if alert.NamespaceName != target.NamespaceName {
 			return false
@@ -131,6 +135,11 @@ func getAlertWithInfo(alert *pb.Alert, target *pb.Alert) bool {
 	}
 	if target.Data != "" {
 		if !strings.Contains(alert.Data, target.Data) {
+			return false
+		}
+	}
+	if target.ContainerName != "" {
+		if !strings.Contains(alert.ContainerName, target.ContainerName) {
 			return false
 		}
 	}
@@ -205,23 +214,70 @@ func KarmorLogStart(logFilter string, ns string, op string, pod string) error {
 		eventChan = make(chan klog.EventInfo, maxEvents)
 	}
 	go func() {
-		err := klog.StartObserver(k8sClient, klog.Options{
-			LogFilter:        logFilter,
-			ReadCAFromSecret: true,
-			TlsCertPath:      "/var/lib/kubearmor/tls",
-			TlsCertProvider:  klog.SelfCertProvider,
-			Namespace:        ns,
-			Operation:        op,
-			PodName:          pod,
-			MsgPath:          "none",
-			EventChan:        eventChan,
-			GRPC:             gRPC,
-		})
+		var opt klog.Options
+		if ns != "" && pod != "" { // for pod
+			opt = klog.Options{
+				LogFilter:        logFilter,
+				ReadCAFromSecret: true,
+				TlsCertPath:      "/var/lib/kubearmor/tls",
+				TlsCertProvider:  klog.SelfCertProvider,
+				Namespace:        ns,
+				Operation:        op,
+				PodName:          pod,
+				MsgPath:          "none",
+				EventChan:        eventChan,
+				GRPC:             gRPC,
+			}
+		} else { // for host
+			opt = klog.Options{
+				LogFilter:        logFilter,
+				ReadCAFromSecret: true,
+				TlsCertPath:      "/var/lib/kubearmor/tls",
+				TlsCertProvider:  klog.SelfCertProvider,
+				Operation:        op,
+				MsgPath:          "none",
+				EventChan:        eventChan,
+				GRPC:             gRPC,
+			}
+		}
+		err := klog.StartObserver(k8sClient, opt)
 		if err != nil {
 			log.Errorf("failed to start observer. Error=%s", err.Error())
 		}
 	}()
 	time.Sleep(2 * time.Second)
+	return nil
+}
+
+func KarmorHostLogStart(logFilter string, op string) error {
+	drainEventChan()
+
+	if eventChan == nil {
+		eventChan = make(chan klog.EventInfo, maxEvents)
+	}
+
+	nullFile, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		err := klog.StartObserver(k8sClient, klog.Options{
+			LogFilter:        logFilter,
+			ReadCAFromSecret: false,
+			LogPath:          nullFile.Name(),
+			Operation:        op,
+			MsgPath:          "none",
+			EventChan:        eventChan,
+			GRPC:             ":32767",
+			Secure:           false,
+		})
+		if err != nil {
+			log.Errorf("failed to start observer. Error=%s", err.Error())
+		}
+	}()
+
+	time.Sleep(3 * time.Second)
 	return nil
 }
 
@@ -239,15 +295,16 @@ func KarmorGetLogs(timeout time.Duration, maxEvents int) ([]*pb.Log, []*pb.Alert
 	for eventChan != nil {
 		select {
 		case evtin := <-eventChan:
-			if evtin.Type == "Alert" {
+			switch evtin.Type {
+			case "Alert":
 				alert := pb.Alert{}
 				protojson.Unmarshal(evtin.Data, &alert)
 				alerts = append(alerts, &alert)
-			} else if evtin.Type == "Log" {
+			case "Log":
 				log := pb.Log{}
 				protojson.Unmarshal(evtin.Data, &log)
 				logs = append(logs, &log)
-			} else {
+			default:
 				log.Errorf("UNKNOWN EVT type %s", evtin.Type)
 			}
 			evtCnt++

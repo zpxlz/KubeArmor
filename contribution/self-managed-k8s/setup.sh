@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 . /etc/os-release
 
@@ -22,24 +22,30 @@ echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selecti
 
 # install dependencies and llvm--toolchain
 sudo apt-get -y install build-essential libelf-dev pkg-config net-tools linux-headers-$(uname -r) linux-tools-$(uname -r)
-wget https://apt.llvm.org/llvm.sh
-chmod +x llvm.sh
+. /etc/os-release
+sudo apt-get -y install build-essential libelf-dev pkg-config
 if [ "$VERSION_CODENAME" == "focal" ] || [ "$VERSION_CODENAME" == "bionic" ]; then
-    sudo ./llvm.sh 12
+    sudo apt-get install -y clang-12 llvm-12
     for tool in "clang" "llc" "llvm-strip" "opt" "llvm-dis"; do
         sudo rm -f /usr/bin/$tool
         sudo ln -s /usr/bin/$tool-12 /usr/bin/$tool
     done
-else # VERSION_CODENAME == jammy
-    sudo ./llvm.sh 14
+elif [ "$VERSION_CODENAME" == "jammy" ]; then
+    sudo apt-get install -y clang-14 llvm-14
     for tool in "clang" "llc" "llvm-strip" "opt" "llvm-dis"; do
         sudo rm -f /usr/bin/$tool
         sudo ln -s /usr/bin/$tool-14 /usr/bin/$tool
     done
+else
+    sudo apt-get install -y clang-19 llvm-19
+    for tool in "clang" "llc" "llvm-strip" "opt" "llvm-dis"; do
+        sudo rm -f /usr/bin/$tool
+        sudo ln -s /usr/bin/$tool-19 /usr/bin/$tool
+    done
 fi
 
 # install libbpf-dev
-if [ "$VERSION_CODENAME" == "jammy" ]; then
+if [ "$VERSION_CODENAME" == "jammy" ]|| [ "$VERSION_CODENAME" == "noble" ]; then
     sudo apt-get -y install libbpf-dev
 fi
 
@@ -85,8 +91,8 @@ elif [ -z "$GOPATH" ]; then
 fi
 
 # download protoc-gen-go
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
 
 # install kubebuilder
 wget --quiet https://github.com/kubernetes-sigs/kubebuilder/releases/download/v3.1.0/kubebuilder_linux_amd64 -O /tmp/build/kubebuilder
@@ -103,7 +109,7 @@ fi
 
 # install kustomize
 cd /tmp/build/
-curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" -o /tmp/install_kustomize.sh && bash /tmp/install_kustomize.sh
 sudo mv kustomize /usr/local/bin
 
 # remove downloaded files

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package enforcer
 
@@ -8,13 +8,13 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/template"
 
 	sprig "github.com/Masterminds/sprig/v3"
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
-	"k8s.io/utils/strings/slices"
 )
 
 // == //
@@ -77,7 +77,7 @@ func (ae *AppArmorEnforcer) SetProcessMatchPaths(path tp.ProcessPathType, prof *
 
 // SetProcessMatchDirectories Function
 func (ae *AppArmorEnforcer) SetProcessMatchDirectories(dir tp.ProcessDirectoryType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.File = head
 	}
 	rule := RuleConfig{}
@@ -105,7 +105,7 @@ func (ae *AppArmorEnforcer) SetProcessMatchDirectories(dir tp.ProcessDirectoryTy
 			fromsource.Rules.Init()
 			prof.FromSource[source] = fromsource
 		}
-		if deny == false {
+		if !deny {
 			if val, ok := prof.FromSource[source]; ok {
 				val.File = head
 				prof.FromSource[source] = val
@@ -117,7 +117,7 @@ func (ae *AppArmorEnforcer) SetProcessMatchDirectories(dir tp.ProcessDirectoryTy
 
 // SetProcessMatchPatterns Function
 func (ae *AppArmorEnforcer) SetProcessMatchPatterns(pat tp.ProcessPatternType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.File = head
 	}
 	rule := RuleConfig{}
@@ -132,7 +132,7 @@ func (ae *AppArmorEnforcer) SetProcessMatchPatterns(pat tp.ProcessPatternType, p
 
 // SetFileMatchPaths Function
 func (ae *AppArmorEnforcer) SetFileMatchPaths(path tp.FilePathType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.File = head
 	}
 	rule := RuleConfig{}
@@ -159,7 +159,7 @@ func (ae *AppArmorEnforcer) SetFileMatchPaths(path tp.FilePathType, prof *Profil
 			fromsource.Rules.Init()
 			prof.FromSource[source] = fromsource
 		}
-		if deny == false {
+		if !deny {
 			if val, ok := prof.FromSource[source]; ok {
 				val.File = head
 				prof.FromSource[source] = val
@@ -171,7 +171,7 @@ func (ae *AppArmorEnforcer) SetFileMatchPaths(path tp.FilePathType, prof *Profil
 
 // SetFileMatchDirectories Function
 func (ae *AppArmorEnforcer) SetFileMatchDirectories(dir tp.FileDirectoryType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.File = head
 	}
 	rule := RuleConfig{}
@@ -200,7 +200,7 @@ func (ae *AppArmorEnforcer) SetFileMatchDirectories(dir tp.FileDirectoryType, pr
 			fromsource.Rules.Init()
 			prof.FromSource[source] = fromsource
 		}
-		if deny == false {
+		if !deny {
 			if val, ok := prof.FromSource[source]; ok {
 				val.File = head
 				prof.FromSource[source] = val
@@ -212,7 +212,7 @@ func (ae *AppArmorEnforcer) SetFileMatchDirectories(dir tp.FileDirectoryType, pr
 
 // SetFileMatchPatterns Function
 func (ae *AppArmorEnforcer) SetFileMatchPatterns(pat tp.FilePatternType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.File = head
 	}
 	rule := RuleConfig{}
@@ -231,7 +231,12 @@ func (ae *AppArmorEnforcer) SetNetworkMatchProtocols(proto tp.NetworkProtocolTyp
 	//forcing the protocol to lowercase
 	proto.Protocol = strings.ToLower(proto.Protocol)
 
-	if deny == false {
+	// handle icmpv6 protocol same as icmp
+	if proto.Protocol == "icmpv6" {
+		proto.Protocol = "icmp"
+	}
+
+	if !deny {
 		prof.Network = head
 	}
 	rule := RuleConfig{}
@@ -254,7 +259,7 @@ func (ae *AppArmorEnforcer) SetNetworkMatchProtocols(proto tp.NetworkProtocolTyp
 			fromsource.Rules.Init()
 			prof.FromSource[source] = fromsource
 		}
-		if deny == false {
+		if !deny {
 			if val, ok := prof.FromSource[source]; ok {
 				val.Network = head
 				prof.FromSource[source] = val
@@ -266,7 +271,7 @@ func (ae *AppArmorEnforcer) SetNetworkMatchProtocols(proto tp.NetworkProtocolTyp
 
 // SetCapabilitiesMatchCapabilities Function
 func (ae *AppArmorEnforcer) SetCapabilitiesMatchCapabilities(cap tp.CapabilitiesCapabilityType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.Capabilities = head
 	}
 	rule := RuleConfig{}
@@ -289,7 +294,7 @@ func (ae *AppArmorEnforcer) SetCapabilitiesMatchCapabilities(cap tp.Capabilities
 			fromsource.Rules.Init()
 			prof.FromSource[source] = fromsource
 		}
-		if deny == false {
+		if !deny {
 			if val, ok := prof.FromSource[source]; ok {
 				val.Capabilities = head
 				prof.FromSource[source] = val
@@ -433,6 +438,12 @@ func (ae *AppArmorEnforcer) GenerateProfileBody(securityPolicies []tp.SecurityPo
 			ae.Logger.Errf("Error while copying global rules to local profile for %s: %s", source, err.Error())
 			continue
 		}
+		for proc, config := range profile.ProcessPaths {
+			add := checkIfGlobalRuleToBeAdded(proc, val.ProcessPaths)
+			if add {
+				newval.ProcessPaths[proc] = config
+			}
+		}
 		for file, config := range profile.FilePaths {
 			add := checkIfGlobalRuleToBeAdded(file, val.FilePaths)
 			if add {
@@ -462,18 +473,38 @@ func (ae *AppArmorEnforcer) GenerateProfileBody(securityPolicies []tp.SecurityPo
 // GenerateAppArmorProfile Function
 func (ae *AppArmorEnforcer) GenerateAppArmorProfile(appArmorProfile string, securityPolicies []tp.SecurityPolicy, defaultPosture tp.DefaultPosture, privileged bool) (int, string, bool) {
 	// check apparmor profile
+	var oldProfile string
+	if strings.Contains(appArmorProfile, "kubearmor.host") {
+		if _, err := os.Stat(filepath.Clean("/etc/apparmor.d/" + "kubearmor.host")); os.IsNotExist(err) {
+			return 0, err.Error(), false
+		}
 
-	if _, err := os.Stat(filepath.Clean("/etc/apparmor.d/" + appArmorProfile)); os.IsNotExist(err) {
-		return 0, err.Error(), false
+		// get the old profile
+		profile, err := os.ReadFile(filepath.Clean("/etc/apparmor.d/" + "kubearmor.host"))
+		if err != nil {
+			return 0, err.Error(), false
+		}
+		oldProfile = string(profile)
+	} else {
+		// this path is expected to have a single component "apparmor-profile"
+		// and this is to ensure that the filename has no path separators or parent directory references
+		if strings.Contains(appArmorProfile, "/") || strings.Contains(appArmorProfile, "\\") || strings.Contains(appArmorProfile, "..") {
+			ae.Logger.Warnf("Invalid appArmor profile name (%s)", appArmorProfile)
+			return 0, "Invalid apparmor profile name: " + appArmorProfile, false
+		}
+
+		if _, err := os.Stat(filepath.Clean("/etc/apparmor.d/" + appArmorProfile)); os.IsNotExist(err) {
+			return 0, err.Error(), false
+		}
+
+		// get the old profile
+
+		profile, err := os.ReadFile(filepath.Clean("/etc/apparmor.d/" + appArmorProfile))
+		if err != nil {
+			return 0, err.Error(), false
+		}
+		oldProfile = string(profile)
 	}
-
-	// get the old profile
-
-	profile, err := os.ReadFile(filepath.Clean("/etc/apparmor.d/" + appArmorProfile))
-	if err != nil {
-		return 0, err.Error(), false
-	}
-	oldProfile := string(profile)
 
 	// generate a profile body
 
@@ -516,7 +547,7 @@ func (ae *AppArmorEnforcer) GenerateAppArmorProfile(appArmorProfile string, secu
 			if err != nil {
 				ae.Logger.Warnf("Unable to create tmp file, err=%s", err.Error())
 			} else {
-				defer os.Remove(file.Name())
+				defer kl.RemoveSafe(file.Name())
 				writer := bufio.NewWriter(file)
 				for _, prof := range profileToDelete {
 					_, err = writer.WriteString(prof + "} \n")

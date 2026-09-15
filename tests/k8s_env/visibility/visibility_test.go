@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package visibility
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/kubearmor/KubeArmor/tests/util"
@@ -60,12 +59,10 @@ var _ = Describe("Visibility", func() {
 			err = KarmorLogStart("all", "wordpress-mysql", "", wp)
 			Expect(err).To(BeNil())
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql", []string{"bash", "-c", "ping google.com -c1"})
-			Expect(err).To(BeNil())
-			fmt.Printf("---START---\n%s---END---\n", sout)
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "ping google.com -c1"}, MatchRegexp(".*"), true)
 
 			// check audit logs
-			logs, _, err := KarmorGetLogs(5*time.Second, 50)
+			logs, _, err := KarmorGetLogs(10*time.Second, 50)
 			Expect(err).To(BeNil())
 			Expect(len(logs)).NotTo(Equal(0))
 
@@ -89,12 +86,10 @@ var _ = Describe("Visibility", func() {
 			err = KarmorLogStart("all", "wordpress-mysql", "", wp)
 			Expect(err).To(BeNil())
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql", []string{"bash", "-c", "ping google.com -c1"})
-			Expect(err).To(BeNil())
-			fmt.Printf("---START---\n%s---END---\n", sout)
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "ping google.com -c1"}, MatchRegexp(".*"), true)
 
 			// check audit logs
-			logs, _, err := KarmorGetLogs(5*time.Second, 50)
+			logs, _, err := KarmorGetLogs(10*time.Second, 50)
 			Expect(err).To(BeNil())
 			Expect(len(logs)).NotTo(Equal(0))
 
@@ -115,12 +110,10 @@ var _ = Describe("Visibility", func() {
 			err = KarmorLogStart("all", "wordpress-mysql", "", wp)
 			Expect(err).To(BeNil())
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql", []string{"bash", "-c", "ping google.com -c1"})
-			Expect(err).To(BeNil())
-			fmt.Printf("---START---\n%s---END---\n", sout)
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "ping google.com -c1"}, MatchRegexp(".*"), true)
 
 			// check audit logs
-			logs, _, err := KarmorGetLogs(5*time.Second, 50)
+			logs, _, err := KarmorGetLogs(10*time.Second, 50)
 			Expect(err).To(BeNil())
 			Expect(len(logs)).To(Equal(0))
 

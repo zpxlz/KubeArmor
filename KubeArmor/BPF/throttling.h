@@ -1,18 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright 2024 Authors of KubeArmor */
+/* Copyright 2026 Authors of KubeArmor */
 
 #ifndef __THROTTLING_H
 #define __THROTTLING_H
+
+#include "common_types.h"
 
 struct alert_throttle_state {
   u64 first_event_timestamp;
   u64 event_count;
   u64 throttle;
-};
-
-struct outer_key {
-  u32 pid_ns;
-  u32 mnt_ns;
 };
 
 struct alert {

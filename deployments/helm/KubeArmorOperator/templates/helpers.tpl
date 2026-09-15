@@ -9,13 +9,11 @@
   value: "{{ .repo }}/{{.images.kubearmorRelay.image}}:{{.images.kubearmorRelay.tag}}"
 - name: RELATED_IMAGE_KUBEARMOR_CONTROLLER
   value: "{{ .repo }}/{{.images.kubearmorController.image}}:{{.images.kubearmorController.tag}}"
-- name: RELATED_IMAGE_KUBE_RBAC_PROXY
-  value: "{{ .repo }}/{{.images.kubeRbacProxy.image}}:{{.images.kubeRbacProxy.tag}}"
 {{- end }}
 
 {{- define "operatorImage" }}
 {{- if .Values.imagePinning }}
-{{- printf "%s/%s:%s" .Values.oci_meta.repo .Values.oci_meta.images.kubearmorOperator.image .Values.oci_meta.images.kubearmorOperator.tag }}
+{{- printf "%s/%s:%s" .Values.kubearmor.repo .Values.kubearmor.images.kubearmorOperator.image .Values.kubearmor.images.kubearmorOperator.tag }}
 {{- else if eq .Values.kubearmorOperator.image.tag "" }}
 {{- printf "%s:%s" .Values.kubearmorOperator.image.repository .Chart.Version }}
 {{- else }}

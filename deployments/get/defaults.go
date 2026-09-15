@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package deployments
 
@@ -9,6 +9,7 @@ import (
 
 var kubearmor = "kubearmor"
 var port int32 = 32767
+var healthPort int32 = 32766
 
 // K8s Object Name Defaults
 var (
@@ -27,11 +28,6 @@ var (
 	KubeArmorControllerClusterRoleBindingName        = "kubearmor-controller-clusterrolebinding"
 	KubeArmorControllerLeaderElectionRoleName        = "kubearmor-controller-leader-election-role"
 	KubeArmorControllerLeaderElectionRoleBindingName = "kubearmor-controller-leader-election-rolebinding"
-	KubeArmorControllerProxyRoleName                 = "kubearmor-controller-proxy-role"
-	KubeArmorControllerProxyRoleBindingName          = "kubearmor-controller-proxy-rolebinding"
-	KubeArmorControllerMetricsReaderRoleName         = "kubearmor-controller-metrics-reader-role"
-	KubeArmorControllerMetricsReaderRoleBindingName  = "kubearmor-controller-metrics-reader-rolebinding"
-	KubeArmorControllerMetricsServiceName            = "kubearmor-controller-metrics-service"
 	KubeArmorControllerWebhookServiceName            = "kubearmor-controller-webhook-service"
 	KubeArmorControllerSecretName                    = "kubearmor-controller-webhook-server-cert"
 	KubeArmorControllerMutatingWebhookConfiguration  = "kubearmor-controller-mutating-webhook-configuration"
@@ -245,7 +241,7 @@ var defaultConfigs = map[string]DaemonSetConfig{
 			apparmorVolMnt,
 			{
 				Name:      "containerd-sock-path",
-				MountPath: "/var/run/containerd/containerd.sock",
+				MountPath: "/run/k0s/containerd.sock",
 				ReadOnly:  true,
 			},
 		},
@@ -269,7 +265,7 @@ var defaultConfigs = map[string]DaemonSetConfig{
 			apparmorVolMnt,
 			{
 				Name:      "containerd-sock-path", // containerd
-				MountPath: "/var/run/containerd/containerd.sock",
+				MountPath: "/run/k3s/containerd/containerd.sock",
 				ReadOnly:  true,
 			},
 		},
@@ -341,7 +337,7 @@ var defaultConfigs = map[string]DaemonSetConfig{
 			apparmorVolMnt,
 			{
 				Name:      "containerd-sock-path", // containerd
-				MountPath: "/var/run/containerd/containerd.sock",
+				MountPath: "/run/containerd/containerd.sock",
 				ReadOnly:  true,
 			},
 		},

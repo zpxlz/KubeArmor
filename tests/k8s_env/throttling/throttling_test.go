@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2024 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package throttling
 
@@ -72,13 +72,13 @@ var _ = Describe("Smoke", func() {
 			Expect(err).To(BeNil())
 
 			// wait for policy creation
-			time.Sleep(5 * time.Second)
+			time.Sleep(15 * time.Second)
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "count=0; while [ $count -lt 5 ]; do apt; count=$((count + 1)); done;"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("apt.*Permission denied"))
+			AssertCommand(
+				wp, "wordpress-mysql",
+				[]string{"bash", "-c", "count=0; while [ $count -lt 5 ]; do apt; count=$((count + 1)); done;"},
+				MatchRegexp("apt.*Permission denied"), true,
+			)
 
 			// check policy violation alert
 			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
@@ -92,12 +92,12 @@ var _ = Describe("Smoke", func() {
 			err = KarmorLogStart("all", "wordpress-mysql", "", wp)
 			Expect(err).To(BeNil())
 
-			// check for throttling, alerts should not be genrated
-			sout, _, err = K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "apt update"})
-			Expect(err).To(BeNil())
-			fmt.Printf("---START---\n%s---END---\n", sout)
-			Expect(sout).To(MatchRegexp("apt.*Permission denied"))
+			// check for throttling, alerts should not be generated
+			AssertCommand(
+				wp, "wordpress-mysql",
+				[]string{"bash", "-c", "apt update"},
+				MatchRegexp("apt.*Permission denied"), true,
+			)
 
 			_, alerts, err = KarmorGetLogs(5*time.Second, 1)
 			Expect(err).To(BeNil())

@@ -1,11 +1,9 @@
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.4.1
-  creationTimestamp: null
+    controller-gen.kubebuilder.io/version: v0.19.0
   name: kubearmorhostpolicies.security.kubearmor.com
 spec:
   group: security.kubearmor.com
@@ -37,14 +35,19 @@ spec:
           API
         properties:
           apiVersion:
-            description: 'APIVersion defines the versioned schema of this representation
-              of an object. Servers should convert recognized schemas to the latest
-              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
             type: string
           kind:
-            description: 'Kind is a string value representing the REST resource this
-              object represents. Servers may infer this from the endpoint the client
-              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
             type: string
           metadata:
             type: object
@@ -83,6 +86,7 @@ spec:
                           items:
                             properties:
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                             type: object
@@ -100,6 +104,60 @@ spec:
                       required:
                       - capability
                       - fromSource
+                      type: object
+                    type: array
+                  message:
+                    type: string
+                  severity:
+                    maximum: 10
+                    minimum: 1
+                    type: integer
+                  tags:
+                    items:
+                      type: string
+                    type: array
+                type: object
+              device:
+                properties:
+                  action:
+                    enum:
+                    - Allow
+                    - Audit
+                    - Block
+                    type: string
+                  matchDevice:
+                    items:
+                      properties:
+                        action:
+                          enum:
+                          - Allow
+                          - Audit
+                          - Block
+                          type: string
+                        class:
+                          type: string
+                        level:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        message:
+                          type: string
+                        protocol:
+                          format: int32
+                          type: integer
+                        severity:
+                          maximum: 10
+                          minimum: 1
+                          type: integer
+                        subClass:
+                          format: int32
+                          type: integer
+                        tags:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - class
                       type: object
                     type: array
                   message:
@@ -137,6 +195,7 @@ spec:
                           items:
                             properties:
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                             type: object
@@ -144,6 +203,8 @@ spec:
                         message:
                           type: string
                         ownerOnly:
+                          type: boolean
+                        pts:
                           type: boolean
                         readOnly:
                           type: boolean
@@ -174,6 +235,7 @@ spec:
                           items:
                             properties:
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                             type: object
@@ -183,8 +245,11 @@ spec:
                         ownerOnly:
                           type: boolean
                         path:
+                          maxLength: 200
                           pattern: ^\/+.*[^\/]$
                           type: string
+                        pts:
+                          type: boolean
                         readOnly:
                           type: boolean
                         severity:
@@ -249,6 +314,40 @@ spec:
                     - Audit
                     - Block
                     type: string
+                  matchDNSQueries:
+                    items:
+                      properties:
+                        action:
+                          enum:
+                          - Allow
+                          - Audit
+                          - Block
+                          type: string
+                        domain:
+                          type: string
+                        fromSource:
+                          items:
+                            properties:
+                              path:
+                                maxLength: 200
+                                pattern: ^\/+.*[^\/]$
+                                type: string
+                            type: object
+                          type: array
+                        message:
+                          type: string
+                        severity:
+                          maximum: 10
+                          minimum: 1
+                          type: integer
+                        tags:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - domain
+                      type: object
+                    type: array
                   matchProtocols:
                     items:
                       properties:
@@ -262,6 +361,7 @@ spec:
                           items:
                             properties:
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                             type: object
@@ -269,7 +369,7 @@ spec:
                         message:
                           type: string
                         protocol:
-                          pattern: (icmp|ICMP|tcp|TCP|udp|UDP|raw|RAW)$
+                          pattern: (tcp|TCP|udp|UDP|raw|RAW|icmp|ICMP|icmpv6|ICMPV6|sctp|SCTP|stream|STREAM|dgram|DGRAM|rdm|RDM|seqpacket|SEQPACKET|dccp|DCCP|packet|PACKET|all|ALL)$
                           type: string
                         severity:
                           maximum: 10
@@ -326,6 +426,7 @@ spec:
                           items:
                             properties:
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                             type: object
@@ -333,6 +434,8 @@ spec:
                         message:
                           type: string
                         ownerOnly:
+                          type: boolean
+                        pts:
                           type: boolean
                         recursive:
                           type: boolean
@@ -357,6 +460,11 @@ spec:
                           - Audit
                           - Block
                           type: string
+                        allowedArgs:
+                          items:
+                            type: string
+                          maxItems: 20
+                          type: array
                         execname:
                           pattern: ^[^\/]+$
                           type: string
@@ -364,6 +472,7 @@ spec:
                           items:
                             properties:
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                             type: object
@@ -373,8 +482,11 @@ spec:
                         ownerOnly:
                           type: boolean
                         path:
+                          maxLength: 200
                           pattern: ^\/+.*[^\/]$
                           type: string
+                        pts:
+                          type: boolean
                         severity:
                           maximum: 10
                           minimum: 1
@@ -438,6 +550,7 @@ spec:
                               dir:
                                 type: string
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                               recursive:
@@ -800,6 +913,7 @@ spec:
                               dir:
                                 type: string
                               path:
+                                maxLength: 200
                                 pattern: ^\/+.*[^\/]$
                                 type: string
                               recursive:
@@ -1177,9 +1291,3 @@ spec:
     storage: true
     subresources:
       status: {}
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []

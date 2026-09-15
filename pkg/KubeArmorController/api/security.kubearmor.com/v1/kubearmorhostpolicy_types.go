@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package v1
 
@@ -16,6 +16,7 @@ type KubeArmorHostPolicySpec struct {
 	Network      HostNetworkType      `json:"network,omitempty"`
 	Capabilities HostCapabilitiesType `json:"capabilities,omitempty"`
 	Syscalls     SyscallsType         `json:"syscalls,omitempty"`
+	Device       DeviceType           `json:"device,omitempty"`
 
 	AppArmor string `json:"apparmor,omitempty"`
 

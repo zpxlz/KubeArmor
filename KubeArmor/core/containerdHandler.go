@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package core is responsible for initiating and maintaining interactions between external entities like K8s,CRIs and internal KubeArmor entities like eBPF Monitor and Log Feeders
 package core
@@ -8,11 +8,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/containerd/typeurl/v2"
+	"google.golang.org/protobuf/proto"
 
 	"golang.org/x/exp/slices"
 
@@ -23,12 +25,14 @@ import (
 	"github.com/kubearmor/KubeArmor/KubeArmor/state"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 
-	pb "github.com/containerd/containerd/api/services/containers/v1"
-	pt "github.com/containerd/containerd/api/services/tasks/v1"
-	"github.com/containerd/containerd/namespaces"
-	"google.golang.org/grpc"
+	"github.com/containerd/containerd/v2/core/events"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	apievents "github.com/containerd/containerd/api/events"
+	task "github.com/containerd/containerd/api/services/tasks/v1"
+	v2 "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 // ======================== //
@@ -72,60 +76,86 @@ func init() {
 
 // ContainerdHandler Structure
 type ContainerdHandler struct {
-	// connection
-	conn *grpc.ClientConn
 
 	// container client
-	client pb.ContainersClient
-
-	// task client
-	taskClient pt.TasksClient
+	client *v2.Client
 
 	// context
 	containerd context.Context
 	docker     context.Context
 
-	// active containers
-	containers map[string]context.Context
+	k8sEventsCh    <-chan *events.Envelope
+	dockerEventsCh <-chan *events.Envelope
+
+	k8sErrCh    <-chan error
+	dockerErrCh <-chan error
 }
 
 // NewContainerdHandler Function
 func NewContainerdHandler() *ContainerdHandler {
 	ch := &ContainerdHandler{}
 
-	conn, err := grpc.Dial(cfg.GlobalCfg.CRISocket, grpc.WithInsecure())
+	// Establish connection to containerd
+	client, err := v2.New(strings.TrimPrefix(cfg.GlobalCfg.CRISocket, "unix://"))
 	if err != nil {
+		kg.Errf("Unable to connect to containerd v2: %v", err)
 		return nil
 	}
+	ch.client = client
 
-	ch.conn = conn
-
-	// container client
-	ch.client = pb.NewContainersClient(ch.conn)
-
-	// task client
-	ch.taskClient = pt.NewTasksClient(ch.conn)
+	// Subscribe to containerd events
 
 	// docker namespace
 	ch.docker = namespaces.WithNamespace(context.Background(), "moby")
 
+	dockerEventsCh, dockerErrCh := client.EventService().Subscribe(ch.docker, "")
+	ch.dockerEventsCh = dockerEventsCh
+	ch.dockerErrCh = dockerErrCh
+
 	// containerd namespace
 	ch.containerd = namespaces.WithNamespace(context.Background(), "k8s.io")
 
-	// active containers
-	ch.containers = map[string]context.Context{}
-
-	kg.Print("Initialized Containerd Handler")
+	k8sEventsCh, k8sErrCh := client.EventService().Subscribe(ch.containerd, "")
+	ch.k8sEventsCh = k8sEventsCh
+	ch.k8sErrCh = k8sErrCh
 
 	return ch
 }
 
+// Reconnect re-establishes the containerd client connection and resubscribes to events
+func (ch *ContainerdHandler) Reconnect() error {
+	// Close existing client if present
+	if ch.client != nil {
+		if err := ch.client.Close(); err != nil {
+			kg.Warnf("Failed to close old containerd client connection: %v", err)
+		}
+	}
+
+	client, err := v2.New(strings.TrimPrefix(cfg.GlobalCfg.CRISocket, "unix://"))
+	if err != nil {
+		return fmt.Errorf("unable to reconnect to containerd: %v", err)
+	}
+	ch.client = client
+
+	// Resubscribe to docker namespace events
+	ch.docker = namespaces.WithNamespace(context.Background(), "moby")
+	dockerEventsCh, dockerErrCh := client.EventService().Subscribe(ch.docker, "")
+	ch.dockerEventsCh = dockerEventsCh
+	ch.dockerErrCh = dockerErrCh
+
+	// Resubscribe to k8s namespace events
+	ch.containerd = namespaces.WithNamespace(context.Background(), "k8s.io")
+	k8sEventsCh, k8sErrCh := client.EventService().Subscribe(ch.containerd, "")
+	ch.k8sEventsCh = k8sEventsCh
+	ch.k8sErrCh = k8sErrCh
+
+	return nil
+}
+
 // Close Function
 func (ch *ContainerdHandler) Close() {
-	if ch.conn != nil {
-		if err := ch.conn.Close(); err != nil {
-			kg.Err(err.Error())
-		}
+	if err := ch.client.Close(); err != nil {
+		kg.Err(err.Error())
 	}
 }
 
@@ -134,23 +164,29 @@ func (ch *ContainerdHandler) Close() {
 // ==================== //
 
 // GetContainerInfo Function
-func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID string, OwnerInfo map[string]tp.PodOwner) (tp.Container, error) {
-	req := pb.GetContainerRequest{ID: containerID}
-	res, err := ch.client.Get(ctx, &req)
+func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID, nodeID string, eventpid uint32, OwnerInfo map[string]tp.PodOwner) (tp.Container, error) {
+	res, err := ch.client.ContainerService().Get(ctx, containerID)
 	if err != nil {
 		return tp.Container{}, err
+	}
+
+	// skip if pause container
+	if res.Labels != nil {
+		if containerKind, ok := res.Labels["io.cri-containerd.kind"]; ok && containerKind == "sandbox" {
+			return tp.Container{}, fmt.Errorf("pause container")
+		}
 	}
 
 	container := tp.Container{}
 
 	// == container base == //
 
-	container.ContainerID = res.Container.ID
-	container.ContainerName = res.Container.ID
+	container.ContainerID = res.ID
+	container.ContainerName = res.ID
 	container.NamespaceName = "Unknown"
 	container.EndPointName = "Unknown"
 
-	containerLabels := res.Container.Labels
+	containerLabels := res.Labels
 	if _, ok := containerLabels["io.kubernetes.pod.namespace"]; ok { // kubernetes
 		if val, ok := containerLabels["io.kubernetes.pod.namespace"]; ok {
 			container.NamespaceName = val
@@ -161,7 +197,7 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 	} else if val, ok := containerLabels["kubearmor.io/namespace"]; ok {
 		container.NamespaceName = val
 	} else {
-		container.NamespaceName = "container_namespace"
+		container.NamespaceName = cfg.GlobalCfg.Host
 	}
 
 	if len(OwnerInfo) > 0 {
@@ -170,7 +206,7 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 		}
 	}
 
-	iface, err := typeurl.UnmarshalAny(res.Container.Spec)
+	iface, err := typeurl.UnmarshalAny(res.Spec)
 	if err != nil {
 		return tp.Container{}, err
 	}
@@ -184,22 +220,54 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 	}
 
 	// == //
+	if eventpid == 0 {
+		taskReq := task.ListPidsRequest{ContainerID: container.ContainerID}
+		if taskRes, err := ch.client.TaskService().ListPids(ctx, &taskReq); err == nil {
+			if len(taskRes.Processes) == 0 {
+				return container, err
+			}
 
-	taskReq := pt.ListPidsRequest{ContainerID: container.ContainerID}
-	if taskRes, err := Containerd.taskClient.ListPids(ctx, &taskReq); err == nil {
+			container.Pid = taskRes.Processes[0].Pid
+
+		} else {
+			return container, err
+		}
+
+	} else {
+		container.Pid = eventpid
+	}
+
+	pid := strconv.Itoa(int(container.Pid))
+
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/pid")); err == nil {
+		if _, err := fmt.Sscanf(data, "pid:[%d]\n", &container.PidNS); err != nil {
+			kg.Warnf("Unable to get PidNS (%s, %s, %s)", containerID, pid, err.Error())
+		}
+	}
+
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/mnt")); err == nil {
+		if _, err := fmt.Sscanf(data, "mnt:[%d]\n", &container.MntNS); err != nil {
+			kg.Warnf("Unable to get MntNS (%s, %s, %s)", containerID, pid, err.Error())
+		}
+	}
+
+	taskReq := task.ListPidsRequest{ContainerID: container.ContainerID}
+	if taskRes, err := ch.client.TaskService().ListPids(ctx, &taskReq); err == nil {
 		if len(taskRes.Processes) == 0 {
 			return container, err
 		}
 
 		pid := strconv.Itoa(int(taskRes.Processes[0].Pid))
 
-		if data, err := os.Readlink("/proc/" + pid + "/ns/pid"); err == nil {
+		container.Pid = taskRes.Processes[0].Pid
+
+		if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/pid")); err == nil {
 			if _, err := fmt.Sscanf(data, "pid:[%d]\n", &container.PidNS); err != nil {
 				kg.Warnf("Unable to get PidNS (%s, %s, %s)", containerID, pid, err.Error())
 			}
 		}
 
-		if data, err := os.Readlink("/proc/" + pid + "/ns/mnt"); err == nil {
+		if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/mnt")); err == nil {
 			if _, err := fmt.Sscanf(data, "mnt:[%d]\n", &container.MntNS); err != nil {
 				kg.Warnf("Unable to get MntNS (%s, %s, %s)", containerID, pid, err.Error())
 			}
@@ -211,12 +279,14 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 	// == //
 
 	if !cfg.GlobalCfg.K8sEnv {
-		container.ContainerImage = res.Container.Image //+ kl.GetSHA256ofImage(inspect.Image)
+		container.ContainerImage = res.Image //+ kl.GetSHA256ofImage(inspect.Image)
 
 		container.NodeName = cfg.GlobalCfg.Host
 
+		container.NodeID = nodeID
+
 		labels := []string{}
-		for k, v := range res.Container.Labels {
+		for k, v := range res.Labels {
 			labels = append(labels, k+"="+v)
 		}
 		for k, v := range spec.Annotations {
@@ -245,68 +315,48 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 func (ch *ContainerdHandler) GetContainerdContainers() map[string]context.Context {
 	containers := map[string]context.Context{}
 
-	req := pb.ListContainersRequest{}
-
-	if containerList, err := ch.client.List(ch.docker, &req, grpc.MaxCallRecvMsgSize(kl.DefaultMaxRecvMaxSize)); err == nil {
-		for _, container := range containerList.Containers {
+	if containerList, err := ch.client.ContainerService().List(ch.docker); err == nil {
+		for _, container := range containerList {
 			containers[container.ID] = ch.docker
 		}
+	} else {
+		kg.Err(err.Error())
 	}
 
-	if containerList, err := ch.client.List(ch.containerd, &req, grpc.MaxCallRecvMsgSize(kl.DefaultMaxRecvMaxSize)); err == nil {
-		for _, container := range containerList.Containers {
+	if containerList, err := ch.client.ContainerService().List(ch.containerd); err == nil {
+		for _, container := range containerList {
 			containers[container.ID] = ch.containerd
 		}
+	} else {
+		kg.Err(err.Error())
 	}
 
 	return containers
 }
 
-// GetNewContainerdContainers Function
-func (ch *ContainerdHandler) GetNewContainerdContainers(containers map[string]context.Context) map[string]context.Context {
-	newContainers := map[string]context.Context{}
-
-	for activeContainerID, context := range containers {
-		if _, ok := ch.containers[activeContainerID]; !ok {
-			newContainers[activeContainerID] = context
-		}
-	}
-
-	return newContainers
-}
-
-// GetDeletedContainerdContainers Function
-func (ch *ContainerdHandler) GetDeletedContainerdContainers(containers map[string]context.Context) map[string]context.Context {
-	deletedContainers := map[string]context.Context{}
-
-	for globalContainerID := range ch.containers {
-		if _, ok := containers[globalContainerID]; !ok {
-			deletedContainers[globalContainerID] = context.TODO()
-			delete(ch.containers, globalContainerID)
-		}
-	}
-
-	ch.containers = containers
-
-	return deletedContainers
-}
-
 // UpdateContainerdContainer Function
-func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, containerID, action string) bool {
+func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, containerID string, containerPid uint32, action string) error {
 	// check if Containerd exists
 	if Containerd == nil {
-		return false
+		return fmt.Errorf("containerd client not initialized")
 	}
 
 	if action == "start" {
 		// get container information from containerd client
-		container, err := Containerd.GetContainerInfo(ctx, containerID, dm.OwnerInfo)
+
+		dm.OwnerInfoLock.RLock()
+		owner := dm.OwnerInfo
+		dm.OwnerInfoLock.RUnlock()
+		container, err := Containerd.GetContainerInfo(ctx, containerID, dm.Node.NodeID, containerPid, owner)
 		if err != nil {
-			return false
+			if strings.Contains(string(err.Error()), "pause container") || strings.Contains(string(err.Error()), "moby") {
+				return fmt.Errorf("skipping pause/moby container: %w", err)
+			}
+			return fmt.Errorf("failed to get container info: %w", err)
 		}
 
 		if container.ContainerID == "" {
-			return false
+			return fmt.Errorf("container ID is empty")
 		}
 
 		endPoint := tp.EndPoint{}
@@ -362,7 +412,12 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 
 					dm.SecurityPoliciesLock.RLock()
 					for _, secPol := range dm.SecurityPolicies {
-						if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+						// required only in ADDED event, this alone will update the namespaceList for csp
+						updateNamespaceListforCSP(&secPol)
+
+						// match ksp || csp
+						if (kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) && kl.MatchExpIdentities(secPol.Spec.Selector, endPoint.Identities)) ||
+							(kl.ContainsElement(secPol.Spec.Selector.NamespaceList, endPoint.NamespaceName) && kl.MatchExpIdentities(secPol.Spec.Selector, endPoint.Identities)) {
 							endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
 						}
 					}
@@ -381,7 +436,9 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 					endPoint.SecurityPolicies = []tp.SecurityPolicy{}
 					dm.SecurityPoliciesLock.RLock()
 					for _, secPol := range dm.SecurityPolicies {
-						if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+						// match ksp || csp
+						if (kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) && kl.MatchExpIdentities(secPol.Spec.Selector, endPoint.Identities)) ||
+							(kl.ContainsElement(secPol.Spec.Selector.NamespaceList, endPoint.NamespaceName) && kl.MatchExpIdentities(secPol.Spec.Selector, endPoint.Identities)) {
 							endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
 						}
 					}
@@ -432,8 +489,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 
 					// add identities and labels if non-k8s
 					if !dm.K8sEnabled {
-						labelsSlice := strings.Split(container.Labels, ",")
-						for _, label := range labelsSlice {
+						for label := range strings.SplitSeq(container.Labels, ",") {
 							key, value, ok := strings.Cut(label, "=")
 							if !ok {
 								continue
@@ -452,7 +508,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			dm.EndPointsLock.Unlock()
 		} else {
 			dm.ContainersLock.Unlock()
-			return false
+			return fmt.Errorf("container namespace information already exists")
 		}
 
 		if dm.SystemMonitor != nil && cfg.GlobalCfg.Policy {
@@ -465,12 +521,19 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			if dm.Presets != nil {
+				dm.Presets.RegisterContainer(container.ContainerID, container.PidNS, container.MntNS)
+			}
 
 			if len(endPoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endPoint yet
 				dm.Logger.UpdateSecurityPolicies("ADDED", endPoint)
 				if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
 					// enforce security policies
 					dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+				}
+				if dm.Presets != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce preset rules
+					dm.Presets.UpdateSecurityPolicies(endPoint)
 				}
 			}
 		}
@@ -487,7 +550,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 		container, ok := dm.Containers[containerID]
 		if !ok {
 			dm.ContainersLock.Unlock()
-			return false
+			return fmt.Errorf("container not found for removal: %s", containerID)
 		}
 		if !dm.K8sEnabled {
 			dm.EndPointsLock.Lock()
@@ -499,6 +562,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 
 		// delete endpoint if no security rules and containers
 		if !dm.K8sEnabled {
+			dm.EndPointsLock.Lock()
 			idx := 0
 			endpointsLength := len(dm.EndPoints)
 			for idx < endpointsLength {
@@ -511,6 +575,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 				}
 				idx++
 			}
+			dm.EndPointsLock.Unlock()
 		}
 
 		dm.EndPointsLock.Lock()
@@ -537,6 +602,9 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			// update NsMap
 			dm.SystemMonitor.DeleteContainerIDFromNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.UnregisterContainer(containerID)
+			if dm.Presets != nil {
+				dm.Presets.UnregisterContainer(containerID)
+			}
 		}
 
 		if cfg.GlobalCfg.StateAgent {
@@ -547,7 +615,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 		dm.Logger.Printf("Detected a container (removed/%.12s/pidns=%d/mntns=%d)", containerID, container.PidNS, container.MntNS)
 	}
 
-	return true
+	return nil
 }
 
 // MonitorContainerdEvents Function
@@ -564,38 +632,142 @@ func (dm *KubeArmorDaemon) MonitorContainerdEvents() {
 
 	dm.Logger.Print("Started to monitor Containerd events")
 
+	containers := Containerd.GetContainerdContainers()
+
+	if len(containers) > 0 {
+		for containerID, context := range containers {
+			if err := dm.UpdateContainerdContainer(context, containerID, 0, "start"); err != nil {
+				kg.Warnf("Failed to update containerd container %s: %s", containerID, err.Error())
+				continue
+			}
+		}
+	}
 	for {
 		select {
 		case <-StopChan:
 			return
 
-		default:
-			containers := Containerd.GetContainerdContainers()
-
-			invalidContainers := []string{}
-
-			newContainers := Containerd.GetNewContainerdContainers(containers)
-			deletedContainers := Containerd.GetDeletedContainerdContainers(containers)
-
-			if len(newContainers) > 0 {
-				for containerID, context := range newContainers {
-					if !dm.UpdateContainerdContainer(context, containerID, "start") {
-						invalidContainers = append(invalidContainers, containerID)
-					}
-				}
+		case err := <-Containerd.k8sErrCh:
+			kg.Warnf("Containerd k8s event subscription error: %v", err)
+			if !dm.reconnectContainerd() {
+				return
 			}
 
-			for _, invalidContainerID := range invalidContainers {
-				delete(Containerd.containers, invalidContainerID)
+		case err := <-Containerd.dockerErrCh:
+			kg.Warnf("Containerd docker event subscription error: %v", err)
+			if !dm.reconnectContainerd() {
+				return
 			}
 
-			if len(deletedContainers) > 0 {
-				for containerID, context := range deletedContainers {
-					dm.UpdateContainerdContainer(context, containerID, "destroy")
+		case envelope, ok := <-Containerd.k8sEventsCh:
+			if !ok {
+				kg.Warn("Containerd k8s event channel closed")
+				if !dm.reconnectContainerd() {
+					return
 				}
+				continue
+			}
+			dm.handleContainerdEvent(envelope, Containerd.containerd)
+
+		case envelope, ok := <-Containerd.dockerEventsCh:
+			if !ok {
+				kg.Warn("Containerd docker event channel closed")
+				if !dm.reconnectContainerd() {
+					return
+				}
+				continue
+			}
+			dm.handleContainerdEvent(envelope, Containerd.docker)
+
+		}
+	}
+}
+
+// reconnectContainerd attempts to reconnect to containerd with backoff.
+// Returns true on success, false if StopChan is signaled during retry.
+func (dm *KubeArmorDaemon) reconnectContainerd() bool {
+	const maxRetryInterval = 60 * time.Second
+	retryInterval := 5 * time.Second
+
+	for {
+		dm.Logger.Printf("Attempting to reconnect to containerd in %v...", retryInterval)
+
+		select {
+		case <-StopChan:
+			return false
+		case <-time.After(retryInterval):
+		}
+
+		if err := Containerd.Reconnect(); err != nil {
+			kg.Warnf("Failed to reconnect to containerd: %v", err)
+			// exponential backoff
+			retryInterval *= 2
+			if retryInterval > maxRetryInterval {
+				retryInterval = maxRetryInterval
+			}
+			continue
+		}
+
+		dm.Logger.Print("Successfully reconnected to containerd")
+
+		// re-sync existing containers after reconnection
+		containers := Containerd.GetContainerdContainers()
+		for containerID, context := range containers {
+			if err := dm.UpdateContainerdContainer(context, containerID, 0, "start"); err != nil {
+				kg.Warnf("Failed to update containerd container %s after reconnect: %s", containerID, err.Error())
 			}
 		}
 
-		time.Sleep(time.Millisecond * 500)
+		return true
+	}
+}
+
+func (dm *KubeArmorDaemon) handleContainerdEvent(envelope *events.Envelope, context context.Context) {
+	if envelope == nil {
+		return
+	}
+
+	// Handle the different event types
+	switch envelope.Topic {
+	case "/containers/delete":
+		deleteContainer := &apievents.ContainerDelete{}
+
+		err := proto.Unmarshal(envelope.Event.GetValue(), deleteContainer)
+		if err != nil {
+			kg.Errf("failed to unmarshal container's delete event: %v", err)
+		}
+		if err := dm.UpdateContainerdContainer(context, deleteContainer.GetID(), 0, "destroy"); err != nil {
+			kg.Warnf("Failed to destroy containerd container %s: %s", deleteContainer.GetID(), err.Error())
+		}
+
+	case "/tasks/start":
+		startTask := &apievents.TaskStart{}
+
+		err := proto.Unmarshal(envelope.Event.GetValue(), startTask)
+		if err != nil {
+			kg.Errf("failed to unmarshal container's start task: %v", err)
+		}
+		if err := dm.UpdateContainerdContainer(context, startTask.GetContainerID(), startTask.GetPid(), "start"); err != nil {
+			kg.Warnf("Failed to start containerd container %s: %s", startTask.GetContainerID(), err.Error())
+		}
+
+	case "/tasks/exit":
+		exitTask := &apievents.TaskExit{}
+
+		err := proto.Unmarshal(envelope.Event.GetValue(), exitTask)
+		if err != nil {
+			kg.Errf("failed to unmarshal container's exit task: %v", err)
+		}
+
+		dm.ContainersLock.RLock()
+		pid := dm.Containers[exitTask.GetContainerID()].Pid
+		dm.ContainersLock.RUnlock()
+
+		if pid == exitTask.GetPid() {
+			if err := dm.UpdateContainerdContainer(context, exitTask.GetContainerID(), pid, "destroy"); err != nil {
+				kg.Warnf("Failed to destroy containerd container %s: %s", exitTask.GetContainerID(), err.Error())
+			}
+		}
+
 	}
 }

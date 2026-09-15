@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package util
 
@@ -27,6 +27,7 @@ import (
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"
 	appsV1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -42,15 +43,16 @@ var kcClient *kc.SecurityV1Client
 
 // ConfigMapData hosts the structure which is used to configure Config Map Data
 type ConfigMapData struct {
-	GRPC                       string
-	Visibility                 string
-	Cluster                    string
-	DefaultFilePosture         string
-	DefaultCapabilitiesPosture string
-	DefaultNetworkPosture      string
-	AlertThrottling            string
-	MaxAlertPerSec             string
-	ThrottleSec                string
+	GRPC                        string
+	Visibility                  string
+	Cluster                     string
+	DefaultFilePosture          string
+	DefaultCapabilitiesPosture  string
+	DefaultNetworkPosture       string
+	AlertThrottling             string
+	MaxAlertPerSec              string
+	ThrottleSec                 string
+	DropResourceFromProcessLogs string
 }
 
 // GetK8sClient function return instance of k8s client
@@ -109,6 +111,7 @@ func NewDefaultConfigMapData() *ConfigMapData {
 	data.AlertThrottling = "false"
 	data.MaxAlertPerSec = "10"
 	data.ThrottleSec = "30"
+	data.DropResourceFromProcessLogs = "false"
 
 	return data
 }
@@ -128,15 +131,16 @@ func (data *ConfigMapData) CreateKAConfigMap() error {
 			},
 		},
 		Data: map[string]string{
-			"gRPC":                       data.GRPC,
-			"cluster":                    data.Cluster,
-			"visibility":                 data.Visibility,
-			"defaultFilePosture":         data.DefaultFilePosture,
-			"defaultCapabilitiesPosture": data.DefaultCapabilitiesPosture,
-			"defaultNetworkPosture":      data.DefaultNetworkPosture,
-			"alertThrottling":            data.AlertThrottling,
-			"maxAlertPerSec":             data.MaxAlertPerSec,
-			"throttleSec":                data.ThrottleSec,
+			"gRPC":                        data.GRPC,
+			"cluster":                     data.Cluster,
+			"visibility":                  data.Visibility,
+			"defaultFilePosture":          data.DefaultFilePosture,
+			"defaultCapabilitiesPosture":  data.DefaultCapabilitiesPosture,
+			"defaultNetworkPosture":       data.DefaultNetworkPosture,
+			"alertThrottling":             data.AlertThrottling,
+			"maxAlertPerSec":              data.MaxAlertPerSec,
+			"throttleSec":                 data.ThrottleSec,
+			"dropResourceFromProcessLogs": data.DropResourceFromProcessLogs,
 		},
 	}
 
@@ -229,7 +233,7 @@ func K8sDeploymentCheck(depname string, ns string, timeout time.Duration) error 
 }
 
 func AnnotationsMatch(pod corev1.Pod, ants []string) bool {
-	if ants == nil || len(ants) <= 0 {
+	if len(ants) <= 0 {
 		return true
 	}
 	for _, ant := range ants {
@@ -319,7 +323,33 @@ func K8sExecInPod(pod string, ns string, cmd []string) (string, string, error) {
 	}
 	buf := &bytes.Buffer{}
 	errBuf := &bytes.Buffer{}
-	exec.Stream(remotecommand.StreamOptions{
+	exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
+		Stdout: buf,
+		Stderr: errBuf,
+	})
+	return buf.String(), errBuf.String(), nil
+}
+
+// K8sExecInPodWithoutTTY Exec into the pod without allocating a TTY. Output: stdout, stderr, err
+func K8sExecInPodWithoutTTY(pod string, ns string, cmd []string) (string, string, error) {
+	req := k8sClient.K8sClientset.CoreV1().RESTClient().Post().Resource("pods").Name(pod).Namespace(ns).SubResource("exec")
+	option := &corev1.PodExecOptions{
+		Command: cmd,
+		Stdout:  true,
+		Stderr:  true,
+		TTY:     false,
+	}
+	req.VersionedParams(
+		option,
+		scheme.ParameterCodec,
+	)
+	exec, err := remotecommand.NewSPDYExecutor(k8sClient.Config, "POST", req.URL())
+	if err != nil {
+		return "", "", err
+	}
+	buf := &bytes.Buffer{}
+	errBuf := &bytes.Buffer{}
+	exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
 		Stdout: buf,
 		Stderr: errBuf,
 	})
@@ -346,7 +376,7 @@ func K8sExecInPodWithContainer(pod string, ns string, container string, cmd []st
 	}
 	buf := &bytes.Buffer{}
 	errBuf := &bytes.Buffer{}
-	exec.Stream(remotecommand.StreamOptions{
+	exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
 		Stdout: buf,
 		Stderr: errBuf,
 	})
@@ -396,8 +426,7 @@ func KspDeleteAll() {
 	if err != nil {
 		return
 	}
-	lines := strings.Split(sout, "\n")
-	for _, line := range lines {
+	for line := range strings.SplitSeq(sout, "\n") {
 		if line == "" {
 			continue
 		}
@@ -475,6 +504,25 @@ func DeleteAllKsp() error {
 	return nil
 }
 
+func DeleteAllNsp() error {
+	nsp, err := kcClient.KubeArmorNetworkPolicies().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		if strings.Contains(err.Error(), "No resource found") {
+			return nil
+		}
+		return err
+	}
+	for _, n := range nsp.Items {
+		err = kcClient.KubeArmorNetworkPolicies().Delete(context.TODO(), n.Name, metav1.DeleteOptions{})
+		if err != nil {
+			log.Errorf("error deleting nsp %s", n.Name)
+			return err
+		}
+		log.Printf("deleted nsp %s ", n.Name)
+	}
+	return nil
+}
+
 // K8sApplyFile can apply deployments, services, namespace, and kubearmorhostpolicy
 func K8sApplyFile(fileName string) error {
 	f, err := os.ReadFile(fileName)
@@ -490,11 +538,10 @@ func K8sApplyFile(fileName string) error {
 		return err
 	}
 
-	// multiple yaml files seperate by ---
+	// multiple yaml files separate by ---
 	fileAsString := string(f[:])
-	sepYamlfiles := strings.Split(fileAsString, "---")
 
-	for _, f := range sepYamlfiles {
+	for f := range strings.SplitSeq(fileAsString, "---") {
 		if f == "\n" || f == "" {
 			// ignore empty cases
 			continue
@@ -529,6 +576,7 @@ func K8sApplyFile(fileName string) error {
 			}
 			ksp.Spec.Network = kcV1.NetworkType{
 				MatchProtocols: append([]kcV1.MatchNetworkProtocolType{}, ksp.Spec.Network.MatchProtocols...),
+				MatchDNSQueries: append([]kcV1.MatchDNSQueryType{}, ksp.Spec.Network.MatchDNSQueries...),
 			}
 
 			result, err := k8sClient.KSPClientset.KubeArmorPolicies(ksp.Namespace).Create(context.TODO(), ksp, metav1.CreateOptions{})
@@ -548,6 +596,7 @@ func K8sApplyFile(fileName string) error {
 			}
 			csp.Spec.Network = kcV1.NetworkType{
 				MatchProtocols: append([]kcV1.MatchNetworkProtocolType{}, csp.Spec.Network.MatchProtocols...),
+				MatchDNSQueries: append([]kcV1.MatchDNSQueryType{}, csp.Spec.Network.MatchDNSQueries...),
 			}
 
 			result, err := k8sClient.KSPClientset.KubeArmorClusterPolicies().Create(context.TODO(), csp, metav1.CreateOptions{})
@@ -602,12 +651,25 @@ func K8sApplyFile(fileName string) error {
 			}
 			hsp.Spec.Network = kcV1.HostNetworkType{
 				MatchProtocols: append([]kcV1.MatchHostNetworkProtocolType{}, hsp.Spec.Network.MatchProtocols...),
+				MatchDNSQueries: append([]kcV1.MatchHostDNSQueryType{}, hsp.Spec.Network.MatchDNSQueries...),
 			}
 
 			result, err := kcClient.KubeArmorHostPolicies().Create(context.TODO(), hsp, metav1.CreateOptions{})
 			if err != nil {
 				if strings.Contains(err.Error(), "already exists") {
 					log.Printf("Policy %s already exists ...", hsp.Name)
+					continue
+				}
+				return err
+			}
+			log.Printf("Created policy %q", result.GetObjectMeta().GetName())
+		case *kcV1.KubeArmorNetworkPolicy:
+			nsp := obj
+
+			result, err := kcClient.KubeArmorNetworkPolicies().Create(context.TODO(), nsp, metav1.CreateOptions{})
+			if err != nil {
+				if strings.Contains(err.Error(), "already exists") {
+					log.Printf("Policy %s already exists ...", nsp.Name)
 					continue
 				}
 				return err
@@ -652,12 +714,27 @@ func K8sRuntime() string {
 	return splitStr[0]
 }
 
-// RunDockerCommand() executes docker commmands
-func RunDockerCommand(cmdstr string) (string, error) {
-	cmdf := strings.Fields(cmdstr)
-	cmd := exec.Command("docker", cmdf...)
-	sout, err := cmd.Output()
-	return string(sout), err
+// RunDockerCommand() executes docker commands
+func RunDockerCommand(cmdParts []string) (string, error) {
+	if len(cmdParts) == 0 {
+		return "", errors.New("empty command")
+	}
+	bin := "docker"
+
+	cmd := exec.Command(bin, cmdParts...)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return "", errors.New(stderr.String())
+	}
+
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 func AssertCommand(wp string, namespace string, cmd []string, match gomegaTypes.GomegaMatcher, eventual bool) {
@@ -676,10 +753,68 @@ func AssertCommand(wp string, namespace string, cmd []string, match gomegaTypes.
 	}
 }
 
+func AssertCommandWithoutTTY(wp string, namespace string, cmd []string, match gomegaTypes.GomegaMatcher, eventual bool) {
+	if eventual {
+		Eventually(func() string {
+			sout, _, err := K8sExecInPodWithoutTTY(wp, namespace, cmd)
+			Expect(err).To(BeNil())
+			fmt.Printf("---START---\n%s---END---\n", sout)
+			return sout
+		}, 10*time.Second, 2*time.Second).Should(match)
+	} else {
+		sout, _, err := K8sExecInPodWithoutTTY(wp, namespace, cmd)
+		Expect(err).To(BeNil())
+		fmt.Printf("---START---\n%s---END---\n", sout)
+		Expect(sout).To(match)
+	}
+}
+
+func AssertHostCommand(cmd []string, match gomegaTypes.GomegaMatcher, eventual bool) {
+	if eventual {
+		Eventually(func() string {
+			output, err := RunHostCommand(cmd)
+			fmt.Printf("---START---\nOUTPUT: %s\nERROR: %v\n---END---\n", output, err)
+			if err != nil {
+				return strings.Join([]string{output, err.Error()}, "\n")
+			}
+			return output
+		}, 10*time.Second, 2*time.Second).Should(match)
+	} else {
+		output, err := RunHostCommand(cmd)
+		fmt.Printf("---START---\nOUTPUT: %s\nERROR: %v\n---END---\n", output, err)
+		var combined string
+		if err != nil {
+			combined = strings.Join([]string{output, err.Error()}, "\n")
+		} else {
+			combined = output
+		}
+		Expect(combined).To(match)
+	}
+}
+
+func RunHostCommand(cmd []string) (string, error) {
+	if len(cmd) == 0 {
+		return "", fmt.Errorf("empty command")
+	}
+
+	args := append([]string{"-c"}, strings.Join(cmd, " "))
+	command := exec.Command("bash", args...)
+	command.Env = []string{}
+
+	output, err := command.CombinedOutput()
+	outStr := strings.TrimSpace(string(output))
+
+	if err != nil {
+		return outStr, fmt.Errorf("cmd %v failed: %w, output: %s", cmd, err, outStr)
+	}
+
+	return outStr, nil
+}
+
 // SendPolicy sends kubearmor policy using grpc client
 func SendPolicy(eventType, path string) error {
 	var policyOptions kclient.PolicyOptions
-	err := kclient.PolicyHandling(eventType, path, policyOptions, "", false)
+	err := kclient.PolicyHandling(eventType, path, policyOptions)
 
 	return err
 }
@@ -694,7 +829,7 @@ func ContainerInfo() (*pb.ProbeResponse, error) {
 		gRPC = "localhost:32767"
 	}
 
-	conn, err := grpc.Dial(gRPC, grpc.WithInsecure())
+	conn, err := grpc.NewClient(gRPC, grpc.DialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
 	if err != nil {
 		return nil, err
 	}

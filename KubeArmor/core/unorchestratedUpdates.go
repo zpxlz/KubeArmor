@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2023 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package core
 
@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/spf13/viper"
 
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
@@ -34,8 +37,63 @@ func (dm *KubeArmorDaemon) SetContainerNSVisibility() {
 	if strings.Contains(cfg.GlobalCfg.Visibility, "capabilities") {
 		visibility.Capabilities = true
 	}
+	if strings.Contains(cfg.GlobalCfg.Visibility, "dns") {
+		visibility.DNS = true
+	}
+	if strings.Contains(cfg.GlobalCfg.Visibility, "ima") {
+		visibility.IMA = true
+	}
+	dm.UpdateVisibility("ADDED", cfg.GlobalCfg.Host, visibility)
+}
 
-	dm.UpdateVisibility("ADDED", "container_namespace", visibility)
+// =================== //
+// == Config Update == //
+// =================== //
+
+// WatchConfigChanges watches for configuration changes and updates the default posture
+func (dm *KubeArmorDaemon) WatchConfigChanges() {
+	viper.OnConfigChange(func(e fsnotify.Event) {
+		dm.Logger.Printf("Config file changed: %s", e.Name)
+		cfg.LoadDynamicConfig()
+
+		// Update the default posture
+		globalPosture := tp.DefaultPosture{
+			FileAction:         validateGlobalDefaultPosture(cfg.GlobalCfg.DefaultFilePosture),
+			NetworkAction:      validateGlobalDefaultPosture(cfg.GlobalCfg.DefaultNetworkPosture),
+			CapabilitiesAction: validateGlobalDefaultPosture(cfg.GlobalCfg.DefaultCapabilitiesPosture),
+			DeviceAction:       validateGlobalDefaultPosture(cfg.GlobalCfg.HostDefaultDevicePosture),
+		}
+		// Update the visibility
+		visibility := tp.Visibility{
+			File:         dm.validateVisibility("file", cfg.GlobalCfg.Visibility),
+			Process:      dm.validateVisibility("process", cfg.GlobalCfg.Visibility),
+			Network:      dm.validateVisibility("network", cfg.GlobalCfg.Visibility),
+			Capabilities: dm.validateVisibility("capabilities", cfg.GlobalCfg.Visibility),
+			DNS:          dm.validateVisibility("dns", cfg.GlobalCfg.Visibility),
+			IMA:          dm.validateVisibility("ima", cfg.GlobalCfg.Visibility),
+		}
+
+		// Apply the changes to the daemon
+		dm.UpdateGlobalPosture(globalPosture)
+
+		// Update default posture for endpoints
+		for _, ep := range dm.EndPoints {
+			dm.Logger.Printf("Updating Default Posture for endpoint %s", ep.EndPointName)
+			dm.UpdateDefaultPosture("MODIFIED", ep.NamespaceName, globalPosture, false)
+			dm.UpdateVisibility("MODIFIED", ep.NamespaceName, visibility)
+		}
+
+		// Update throttling configs
+		dm.SystemMonitor.UpdateThrottlingConfig()
+
+		// Update USB Device Handler
+		dm.UpdateUSBDeviceHandler(cfg.GlobalCfg.USBDeviceHandler)
+
+		// Update the default posture and visibility for the unorchestrated containers
+		dm.SystemMonitor.UpdateVisibility()
+		dm.UpdateHostSecurityPolicies()
+	})
+	viper.WatchConfig()
 }
 
 // ====================================== //
@@ -57,9 +115,14 @@ func (dm *KubeArmorDaemon) MatchandUpdateContainerSecurityPolicies(cid string) {
 			if cfg.GlobalCfg.Policy {
 				// update security policies
 				dm.Logger.UpdateSecurityPolicies("MODIFIED", ep)
-				if dm.RuntimeEnforcer != nil && ep.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-					// enforce security policies
-					dm.RuntimeEnforcer.UpdateSecurityPolicies(ep)
+				if ep.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					if dm.RuntimeEnforcer != nil {
+						// enforce security policies
+						dm.RuntimeEnforcer.UpdateSecurityPolicies(ep)
+					}
+					if dm.Presets != nil {
+						dm.Presets.UpdateSecurityPolicies(ep)
+					}
 				}
 			}
 		}
@@ -128,7 +191,8 @@ func (dm *KubeArmorDaemon) handlePolicyEvent(eventType string, createEndPoint bo
 	}
 
 	var privilegedProfiles map[string]struct{}
-	if eventType == "ADDED" {
+	switch eventType {
+	case "ADDED":
 		dm.RuntimeEnforcer.UpdateAppArmorProfiles(containername, "ADDED", appArmorAnnotations, privilegedProfiles)
 
 		newPoint.SecurityPolicies = append(newPoint.SecurityPolicies, secPolicy)
@@ -161,34 +225,48 @@ func (dm *KubeArmorDaemon) handlePolicyEvent(eventType string, createEndPoint bo
 			// update security policies
 			dm.Logger.UpdateSecurityPolicies("ADDED", newPoint)
 
-			if dm.RuntimeEnforcer != nil && newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-				// enforce security policies
-				dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+			if newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+				if dm.RuntimeEnforcer != nil {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+				}
+				if dm.Presets != nil {
+					dm.Presets.UpdateSecurityPolicies(newPoint)
+				}
 			}
 		}
-	} else if eventType == "MODIFIED" {
+	case "MODIFIED":
 		dm.EndPoints[endpointIdx] = newPoint
 		if cfg.GlobalCfg.Policy {
 			// update security policies
 			dm.Logger.UpdateSecurityPolicies("MODIFIED", newPoint)
 
-			if dm.RuntimeEnforcer != nil && newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-				// enforce security policies
-				dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+			if newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+				if dm.RuntimeEnforcer != nil {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+				}
+				if dm.Presets != nil {
+					// enforce preset rules
+					dm.Presets.UpdateSecurityPolicies(newPoint)
+				}
 			}
 		}
-	} else { // DELETED
+	default: // DELETED
 		// update security policies after policy deletion
-		dm.EndPoints[endpointIdx] = newPoint
-
-		dm.Logger.UpdateSecurityPolicies("DELETED", newPoint)
-		dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
-
-		// delete endpoint if no containers or policies
-		if len(newPoint.Containers) == 0 && len(newPoint.SecurityPolicies) == 0 {
-			dm.EndPoints = append(dm.EndPoints[:endpointIdx], dm.EndPoints[endpointIdx+1:]...)
-			// since the length of endpoints slice reduced
-			endpointIdx--
+		if endpointIdx >= 0 {
+			dm.EndPoints[endpointIdx] = newPoint
+			dm.Logger.UpdateSecurityPolicies("DELETED", newPoint)
+			dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+			if dm.Presets != nil {
+				dm.Presets.UpdateSecurityPolicies(newPoint)
+			}
+			// delete endpoint if no containers or policies
+			if len(newPoint.Containers) == 0 && len(newPoint.SecurityPolicies) == 0 {
+				dm.EndPoints = append(dm.EndPoints[:endpointIdx], dm.EndPoints[endpointIdx+1:]...)
+				// since the length of endpoints slice reduced
+				endpointIdx--
+			}
 		}
 	}
 
@@ -202,7 +280,7 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 	secPolicy := tp.SecurityPolicy{}
 
 	secPolicy.Metadata = map[string]string{}
-	secPolicy.Metadata["namespaceName"] = "container_namespace" //event.Object.Metadata.Namespace
+	secPolicy.Metadata["namespaceName"] = cfg.GlobalCfg.Host
 	secPolicy.Metadata["policyName"] = event.Object.Metadata.Name
 
 	if err := kl.Clone(event.Object.Spec, &secPolicy.Spec); err != nil {
@@ -211,11 +289,8 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 	}
 
 	kl.ObjCommaExpandFirstDupOthers(&secPolicy.Spec.Network.MatchProtocols)
+	kl.ObjCommaExpandFirstDupOthers(&secPolicy.Spec.Network.MatchDNSQueries)
 	kl.ObjCommaExpandFirstDupOthers(&secPolicy.Spec.Capabilities.MatchCapabilities)
-
-	if secPolicy.Spec.Severity == 0 {
-		secPolicy.Spec.Severity = 1 // the lowest severity, by default
-	}
 
 	switch secPolicy.Spec.Action {
 	case "allow":
@@ -259,9 +334,7 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 		}
 	}
 
-	sort.Slice(secPolicy.Spec.Selector.Identities, func(i, j int) bool {
-		return secPolicy.Spec.Selector.Identities[i] < secPolicy.Spec.Selector.Identities[j]
-	})
+	slices.Sort(secPolicy.Spec.Selector.Identities)
 
 	// add severities, tags, messages, and actions
 
@@ -517,6 +590,42 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 		}
 	}
 
+	if len(secPolicy.Spec.Network.MatchDNSQueries) > 0 {
+		for idx, dns := range secPolicy.Spec.Network.MatchDNSQueries {
+			if dns.Severity == 0 {
+				if secPolicy.Spec.Network.Severity != 0 {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Severity = secPolicy.Spec.Network.Severity
+				} else {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Severity = secPolicy.Spec.Severity
+				}
+			}
+
+			if len(dns.Tags) == 0 {
+				if len(secPolicy.Spec.Network.Tags) > 0 {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Tags = secPolicy.Spec.Network.Tags
+				} else {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Tags = secPolicy.Spec.Tags
+				}
+			}
+
+			if len(dns.Message) == 0 {
+				if len(secPolicy.Spec.Network.Message) > 0 {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Message = secPolicy.Spec.Network.Message
+				} else {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Message = secPolicy.Spec.Message
+				}
+			}
+
+			if len(dns.Action) == 0 {
+				if len(secPolicy.Spec.Network.Action) > 0 {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Action = secPolicy.Spec.Network.Action
+				} else {
+					secPolicy.Spec.Network.MatchDNSQueries[idx].Action = secPolicy.Spec.Action
+				}
+			}
+		}
+	}
+
 	if len(secPolicy.Spec.Capabilities.MatchCapabilities) > 0 {
 		for idx, cap := range secPolicy.Spec.Capabilities.MatchCapabilities {
 			if cap.Severity == 0 {
@@ -587,13 +696,14 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 	newPoint := tp.EndPoint{}
 	policyStatus := pb.PolicyStatus_Applied
 
+	// consider reducing coverage for this lock
 	dm.EndPointsLock.Lock()
 	defer dm.EndPointsLock.Unlock()
 	for idx, endPoint := range dm.EndPoints {
 		endPointIndex++
 
 		// update container rules if there exists another endpoint with same policy.Metadata["policyName"]
-		// this is for handling cases when an existing policy has been sent with modified identites - we delete security policies
+		// this is for handling cases when an existing policy has been sent with modified identities - we delete security policies
 		// from previously matched endpoint
 		for policyIndex, policy := range endPoint.SecurityPolicies {
 			if policy.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] && policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] && !kl.MatchIdentities(secPolicy.Spec.Selector.Identities, endPoint.Identities) {
@@ -605,7 +715,9 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 					dm.Logger.UpdateSecurityPolicies("DELETED", endPoint)
 					endPoint.SecurityPolicies = append(endPoint.SecurityPolicies[:0], endPoint.SecurityPolicies[1:]...)
 					dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
-
+					if dm.Presets != nil {
+						dm.Presets.UpdateSecurityPolicies(endPoint)
+					}
 					endPoint = tp.EndPoint{}
 					endPointIndex--
 				} else if len(endPoint.SecurityPolicies) >= 1 {
@@ -622,9 +734,15 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 						// update security policies
 						dm.Logger.UpdateSecurityPolicies("MODIFIED", endPoint)
 
-						if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-							// enforce security policies
-							dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+						if endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+							if dm.RuntimeEnforcer != nil {
+								// enforce security policies
+								dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+							}
+							if dm.Presets != nil {
+								// enforce preset rules
+								dm.Presets.UpdateSecurityPolicies(endPoint)
+							}
 						}
 					}
 				}
@@ -661,28 +779,29 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 
 	// backup/remove container policies
 	if !dm.K8sEnabled && (cfg.GlobalCfg.KVMAgent || cfg.GlobalCfg.Policy) {
-		if event.Type == "ADDED" || event.Type == "MODIFIED" {
+		switch event.Type {
+		case "ADDED", "MODIFIED":
 			// backup SecurityPolicy to file
 			dm.backupKubeArmorContainerPolicy(secPolicy)
-		} else if event.Type == "DELETED" {
+		case "DELETED":
 			dm.removeBackUpPolicy(secPolicy.Metadata["policyName"])
 		}
 	}
-	if event.Type == "ADDED" {
+	switch event.Type {
+	case "ADDED":
 		return pb.PolicyStatus_Applied
-	} else if event.Type == "DELETED" {
+	case "DELETED":
 		return pb.PolicyStatus_Deleted
 	}
 
 	return pb.PolicyStatus_Modified
 }
 
-// ================================= //
-// == HostPolicy Backup & Restore == //
-// ================================= //
+// ====================== //
+// == Backup & Restore == //
+// ====================== //
 
-// backupKubeArmorHostPolicy Function
-func (dm *KubeArmorDaemon) backupKubeArmorHostPolicy(policy tp.HostSecurityPolicy) {
+func (dm *KubeArmorDaemon) backupPolicy(kind string, metadata map[string]string, spec any) {
 	// Check for "/opt/kubearmor/policies" path. If dir not found, create the same
 	if _, err := os.Stat(cfg.PolicyDir); err != nil {
 		if err = os.MkdirAll(cfg.PolicyDir, 0700); err != nil {
@@ -691,42 +810,44 @@ func (dm *KubeArmorDaemon) backupKubeArmorHostPolicy(policy tp.HostSecurityPolic
 		}
 	}
 
+	backup := struct {
+		Kind     string            `json:"kind"`
+		Metadata map[string]string `json:"metadata"`
+		Spec     interface{}       `json:"spec"`
+	}{
+		Kind:     kind,
+		Metadata: metadata,
+		Spec:     spec,
+	}
+
 	var file *os.File
 	var err error
 
-	if file, err = os.Create(cfg.PolicyDir + policy.Metadata["policyName"] + ".yaml"); err == nil {
-		if policyBytes, err := json.Marshal(policy); err == nil {
+	if file, err = os.Create(cfg.PolicyDir + metadata["policyName"] + ".yaml"); err == nil {
+		if policyBytes, err := json.Marshal(backup); err == nil {
 			if _, err = file.Write(policyBytes); err == nil {
 				if err := file.Close(); err != nil {
-					dm.Logger.Errf(err.Error())
+					dm.Logger.Err(err.Error())
 				}
 			}
 		}
 	}
+
+}
+
+// backupKubeArmorHostPolicy Function
+func (dm *KubeArmorDaemon) backupKubeArmorHostPolicy(policy tp.HostSecurityPolicy) {
+	dm.backupPolicy("KubeArmorHostPolicy", policy.Metadata, policy.Spec)
 }
 
 // Back up KubeArmor container policies in /opt/kubearmor/policies
 func (dm *KubeArmorDaemon) backupKubeArmorContainerPolicy(policy tp.SecurityPolicy) {
-	// Check for "/opt/kubearmor/policies" path. If dir not found, create the same
-	if _, err := os.Stat(cfg.PolicyDir); err != nil {
-		if err = os.MkdirAll(cfg.PolicyDir, 0700); err != nil {
-			kg.Warnf("Dir creation failed for [%v]", cfg.PolicyDir)
-			return
-		}
-	}
+	dm.backupPolicy("KubeArmorPolicy", policy.Metadata, policy.Spec)
+}
 
-	var file *os.File
-	var err error
-
-	if file, err = os.Create(cfg.PolicyDir + policy.Metadata["policyName"] + ".yaml"); err == nil {
-		if policyBytes, err := json.Marshal(policy); err == nil {
-			if _, err = file.Write(policyBytes); err == nil {
-				if err := file.Close(); err != nil {
-					dm.Logger.Errf(err.Error())
-				}
-			}
-		}
-	}
+// backupKubeArmorNetworkPolicy Function
+func (dm *KubeArmorDaemon) backupKubeArmorNetworkPolicy(policy tp.NetworkSecurityPolicy) {
+	dm.backupPolicy("KubeArmorNetworkPolicy", policy.Metadata, policy.Spec)
 }
 
 func (dm *KubeArmorDaemon) restoreKubeArmorPolicies() {
@@ -741,6 +862,7 @@ func (dm *KubeArmorDaemon) restoreKubeArmorPolicies() {
 			if data, err := os.ReadFile(cfg.PolicyDir + file.Name()); err == nil {
 
 				var k struct {
+					Kind     string            `json:"kind"`
 					Metadata map[string]string `json:"metadata"`
 				}
 
@@ -760,6 +882,17 @@ func (dm *KubeArmorDaemon) restoreKubeArmorPolicies() {
 						})
 					}
 
+				} else if k.Kind == "KubeArmorNetworkPolicy" {
+					var networkPolicy tp.K8sKubeArmorNetworkPolicy
+					if err := json.Unmarshal(data, &networkPolicy); err == nil {
+						networkPolicy.Metadata.Name = k.Metadata["policyName"]
+						dm.ParseAndUpdateNetworkSecurityPolicy(tp.K8sKubeArmorNetworkPolicyEvent{
+							Type:   "ADDED",
+							Object: networkPolicy,
+						})
+					} else {
+						kg.Errf("Failed to unmarshal network policy: %v", err)
+					}
 				} else { // HostSecurityPolicy
 					var hostPolicy tp.K8sKubeArmorHostPolicy
 					if err := json.Unmarshal(data, &hostPolicy); err == nil {
@@ -791,7 +924,7 @@ func (dm *KubeArmorDaemon) removeBackUpPolicy(name string) {
 		return
 	}
 
-	if err := os.Remove(fname); err != nil {
+	if err := kl.RemoveSafe(fname); err != nil {
 		kg.Errf("unable to delete file:%s err=%s", fname, err.Error())
 	}
 }

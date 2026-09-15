@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package main
 
@@ -28,7 +28,7 @@ func main() {
 	var namespace = *nsPtr
 
 	for _, env := range envs {
-		v := []interface{}{
+		v := []any{
 			// ServiceAccounts
 			dp.GetServiceAccount(namespace),
 			dp.GetRelayServiceAccount(namespace),
@@ -41,20 +41,17 @@ func main() {
 			kcrd.GetHspCRD(),
 			kcrd.GetKspCRD(),
 			kcrd.GetCspCRD(),
+			kcrd.GetNspCRD(),
 
 			// ClusterRoles
 			dp.GetClusterRole(),
 			dp.GetRelayClusterRole(),
 			dp.GetKubeArmorControllerClusterRole(),
-			dp.GetKubeArmorControllerProxyRole(),
-			dp.GetKubeArmorControllerMetricsReaderRole(),
 
 			// ClusterRoleBindings
 			dp.GetClusterRoleBinding(namespace),
 			dp.GetRelayClusterRoleBinding(namespace),
 			dp.GetKubeArmorControllerClusterRoleBinding(namespace),
-			dp.GetKubeArmorControllerProxyRoleBinding(namespace),
-			dp.GetKubeArmorControllerMetricsReaderRoleBinding(namespace),
 
 			// Roles
 			dp.GetKubeArmorControllerLeaderElectionRole(namespace),
@@ -62,7 +59,6 @@ func main() {
 
 			// Services
 			dp.GetRelayService(namespace),
-			dp.GetKubeArmorControllerMetricsService(namespace),
 			dp.GetKubeArmorControllerWebhookService(namespace),
 
 			// Apps
@@ -93,7 +89,7 @@ func main() {
 
 }
 
-func writeToYAML(f *os.File, o interface{}) error {
+func writeToYAML(f *os.File, o any) error {
 	// Use "clarketm/json" to marshal so as to support zero values of structs with omitempty
 	j, err := json.Marshal(o)
 	if err != nil {

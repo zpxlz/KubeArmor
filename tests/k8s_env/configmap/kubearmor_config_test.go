@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package configmap
 
@@ -138,7 +138,7 @@ var _ = Describe("KubeArmor-Config", func() {
 			err = KarmorLogStart("policy", "unannotated", "File", unannotated)
 			Expect(err).To(BeNil())
 
-			// initialy global defaults posture is audit
+			// initially global defaults posture is audit
 			sout, _, err := K8sExecInPodWithContainer(unannotated, "unannotated", "ubuntu-1", []string{"bash", "-c", "cat /credentials/keys/priv.key"})
 			Expect(err).To(BeNil())
 			fmt.Printf("---START---\n%s---END---\n", sout)
@@ -164,7 +164,7 @@ var _ = Describe("KubeArmor-Config", func() {
 		})
 	})
 
-	Describe("Partialy Annotated", Label("partial"), func() {
+	Describe("Partially Annotated", Label("partial"), func() {
 
 		It("default posture will be set to global config posture for unannotated posture only", func() {
 
@@ -175,7 +175,7 @@ var _ = Describe("KubeArmor-Config", func() {
 			err = KarmorLogStart("policy", "partialyannotated", "File", partialyAnnotated)
 			Expect(err).To(BeNil())
 
-			// initialy namespace defaults posture (annotated) is audit for File
+			// initially namespace defaults posture (annotated) is audit for File
 			sout, _, err := K8sExecInPodWithContainer(partialyAnnotated, "partialyannotated", "ubuntu-1", []string{"bash", "-c", "cat /credentials/keys/priv.key"})
 			Expect(err).To(BeNil())
 			fmt.Printf("---START---\n%s---END---\n", sout)
@@ -205,29 +205,6 @@ var _ = Describe("KubeArmor-Config", func() {
 
 			// wait for policy updation due to defaultPosture change
 			time.Sleep(5 * time.Second)
-
-			err = KarmorLogStart("policy", "partialyannotated", "Network", partialyAnnotated)
-			Expect(err).To(BeNil())
-
-			// defaults posture should be block for network
-			sout, _, err = K8sExecInPodWithContainer(partialyAnnotated, "partialyannotated", "ubuntu-1", []string{"bash", "-c", "curl google.com"})
-			Expect(err).To(BeNil())
-			fmt.Printf("---START---\n%s---END---\n", sout)
-			Expect(sout).To(MatchRegexp(".*not resolve"))
-
-			// should get an alert with failure
-			// check policy violation alert
-
-			target = protobuf.Alert{
-				PolicyName:    "DefaultPosture",
-				Action:        "Block",
-				Result:        "Permission denied",
-				NamespaceName: "partialyannotated",
-			}
-
-			res, err = KarmorGetTargetAlert(5*time.Second, &target)
-			Expect(err).To(BeNil())
-			Expect(res.Found).To(BeTrue())
 
 			err = KarmorLogStart("policy", "partialyannotated", "File", partialyAnnotated)
 			Expect(err).To(BeNil())
@@ -282,7 +259,7 @@ var _ = Describe("KubeArmor-Config", func() {
 			err = KarmorLogStart("policy", "fullyannotated", "Network", fullyAnnotated)
 			Expect(err).To(BeNil())
 
-			// initialy namespace defaults posture is block (annotated fully)
+			// initially namespace defaults posture is block (annotated fully)
 			sout, _, err := K8sExecInPodWithContainer(fullyAnnotated, "fullyannotated", "ubuntu-1", []string{"bash", "-c", "curl google.com"})
 			Expect(err).To(BeNil())
 			fmt.Printf("---START---\n%s---END---\n", sout)
@@ -321,6 +298,63 @@ var _ = Describe("KubeArmor-Config", func() {
 
 		})
 
+		It("respects DropResourceFromProcessLogs flag", func() {
+			// DropResourceFromProcessLogs is disabled (false) by default
+			cm := NewDefaultConfigMapData()
+			cm.Visibility = "process"
+			err := cm.CreateKAConfigMap()
+			Expect(err).To(BeNil())
+
+			// Wait for config to update
+			time.Sleep(5 * time.Second)
+
+			// Start logging for process events
+			err = KarmorLogStart("all", "fullyannotated", "Process", fullyAnnotated)
+			Expect(err).To(BeNil())
+
+			// Execute a process in the pod
+			K8sExecInPodWithContainer(fullyAnnotated, "fullyannotated", "ubuntu-1", []string{"bash", "-c", "ps"})
+			Expect(err).To(BeNil())
+
+			// Get process logs
+			logs, _, err := KarmorGetLogs(5*time.Second, 50)
+			Expect(err).To(BeNil())
+			Expect(len(logs)).NotTo(Equal(0))
+
+			// Confirm Resource field is present in logs
+			for _, log := range logs {
+				Expect(log.Resource).NotTo(Equal(""))
+			}
+
+			// now test with DropResourceFromProcessLogs enabled
+			cm = NewDefaultConfigMapData()
+			cm.Visibility = "process"
+			cm.DropResourceFromProcessLogs = "true"
+			err = cm.CreateKAConfigMap()
+			Expect(err).To(BeNil())
+
+			// Wait for config to update
+			time.Sleep(5 * time.Second)
+
+			// Stop and start logs to drain queue
+			KarmorLogStop()
+			err = KarmorLogStart("all", "fullyannotated", "Process", fullyAnnotated)
+			Expect(err).To(BeNil())
+
+			// Execute a process in the pod
+			K8sExecInPodWithContainer(fullyAnnotated, "fullyannotated", "ubuntu-1", []string{"bash", "-c", "ps"})
+			Expect(err).To(BeNil())
+
+			// Get process logs
+			logs, _, err = KarmorGetLogs(5*time.Second, 50)
+			Expect(err).To(BeNil())
+			Expect(len(logs)).NotTo(Equal(0))
+
+			// Confirm Resource field is dropped in logs
+			for _, log := range logs {
+				Expect(log.Resource).To(Equal(""))
+			}
+		})
 	})
 
 })

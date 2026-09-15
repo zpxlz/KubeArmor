@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 . /etc/os-release
 
@@ -39,7 +39,7 @@ elif [ "$ID" == "ubuntu" ]; then
 
     if [ ! -x "$(command -v vagrant)" ]; then
         # install vagrant
-        wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        wget -O /tmp/hashicorp.gpg https://apt.releases.hashicorp.com/gpg && gpg --dearmor < /tmp/hashicorp.gpg | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
         sudo apt update && sudo apt install vagrant
     fi

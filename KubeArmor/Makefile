@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2022 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 CURDIR          := $(shell pwd)
 CRDDIR          := $(realpath $(CURDIR)/../deployments/CRD)
@@ -17,7 +17,8 @@ $(shell go install github.com/ahmetb/govvv)	# This works for older go version
 $(shell go install github.com/ahmetb/govvv@latest) # This works for new go version
 endif
 
-GIT_INFO := $(shell govvv -flags)
+PKG      := $(shell go list ./buildinfo)
+GIT_INFO := $(shell govvv -flags -pkg $(PKG))
 
 .PHONY: build
 build: protobuf
@@ -26,11 +27,9 @@ ifneq (, $(shell which bpftool))
 ifneq (, $(wildcard /sys/kernel/btf/vmlinux))
 	cd $(CURDIR); bpftool btf dump file /sys/kernel/btf/vmlinux format c > BPF/vmlinux.h || true
 endif
-ifneq (, $(shell which llvm-strip))
-	if grep -q bpf '/sys/kernel/security/lsm'; then \
-		cd $(CURDIR); go generate ./... || true; \
-	fi
 endif
+ifneq (, $(shell which clang))
+	cd $(CURDIR); go generate ./...
 endif
 	cd $(CURDIR); CGO_ENABLED=0 go build -ldflags "$(GIT_INFO)" -o kubearmor main.go
 
@@ -48,6 +47,7 @@ run: build
 	cd $(CRDDIR); kubectl apply -f KubeArmorPolicy.yaml
 	cd $(CRDDIR); kubectl apply -f KubeArmorClusterPolicy.yaml
 	cd $(CRDDIR); kubectl apply -f KubeArmorHostPolicy.yaml
+	cd $(CRDDIR); kubectl apply -f KubeArmorNetworkPolicy.yaml
 	cd $(CURDIR); sudo rm -f /tmp/kubearmor.log
 	cd $(CURDIR)/BPF; make clean
 	cd $(CURDIR)/BPF; make
@@ -62,7 +62,7 @@ run-container: build
 run-host-only: build
 	cd $(CRDDIR); kubectl apply -f KubeArmorHostPolicy.yaml
 	cd $(CURDIR); sudo rm -f /tmp/kubearmor.log
-	cd $(CURDIR); sudo -E ./kubearmor -logPath=/tmp/kubearmor.log -enableKubeArmorPolicy=false -enableKubeArmorHostPolicy=true -hostVisibility=process,file,network,capabilities
+	cd $(CURDIR); sudo -E ./kubearmor -logPath=/tmp/kubearmor.log -enableKubeArmorPolicy=false -enableKubeArmorHostPolicy=true -hostVisibility=process,file,network,capabilities -k8s=false
 
 .PHONY: test
 test:
@@ -73,6 +73,9 @@ test:
 .PHONY: testall
 testall:
 	cd $(CURDIR); sudo rm -f /tmp/kubearmor.log
+ifneq (, $(shell which clang))
+	cd $(CURDIR); go generate ./...
+endif
 	cd $(CURDIR)/feeder; go mod tidy
 	cd $(CURDIR)/feeder; sudo -E $(GO_EXEC) clean -testcache .; sudo -E $(GO_EXEC) test -v -coverprofile=.coverprofile .
 	cd $(CURDIR)/enforcer; go mod tidy
@@ -113,7 +116,7 @@ ifeq (, $(shell which gosec))
 	rm -rf $$GOSEC_TMP_DIR ;\
 	}
 endif
-	cd $(CURDIR); gosec -exclude=G402 ./...
+	cd $(CURDIR); gosec -exclude=G402,G115 ./...
 
 .PHONY: local-release
 local-release: build
@@ -125,8 +128,7 @@ ifeq (, $(shell which goreleaser))
 endif
 	cd $(CURDIR)/BPF; make clean
 	cd $(CURDIR)/BPF; make
-	cd $(CURDIR); curl -sfL https://raw.githubusercontent.com/kubearmor/kubearmor-client/main/install.sh | sh -s -- -b .
-	cd $(CURDIR); VERSION=$(shell git describe --tags --always --dirty) goreleaser release --clean --skip=publish,sign,validate --snapshot
+	cd $(CURDIR);ARCH=$(shell go env GOARCH) VERSION=$(shell git describe --tags --always --dirty) goreleaser release --clean --skip=publish,sign,validate --snapshot
 
 .PHONY: scan
 scan: 

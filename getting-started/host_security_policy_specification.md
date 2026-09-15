@@ -11,7 +11,7 @@ metadata:
   name: [policy name]
 
 spec:
-  severity: [1-10]                         # --> optional (1 by default)
+  severity: [1-10]                         # --> optional 
   tags: ["tag", ...]                       # --> optional
   message: [message]                       # --> optional
 
@@ -25,13 +25,13 @@ spec:
     - path: [absolute executable path]
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchDirectories:
     - dir: [absolute directory path]
       recursive: [true|false]              # --> optional
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchPatterns:
     - pattern: [regex pattern]
       ownerOnly: [true|false]              # --> optional
@@ -42,14 +42,14 @@ spec:
       readOnly: [true|false]               # --> optional
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchDirectories:
     - dir: [absolute directory path]
       recursive: [true|false]              # --> optional
       readOnly: [true|false]               # --> optional
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchPatterns:
     - pattern: [regex pattern]
       readOnly: [true|false]               # --> optional
@@ -59,13 +59,20 @@ spec:
     matchProtocols:
     - protocol: [TCP|tcp|UDP|udp|ICMP|icmp]
       fromSource:
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
+
+  device:
+    matchDevice:
+    - class: [class name|decimal|hex]
+      subClass: [0-255]                    # --> optional
+      protocol: [0-255]                    # --> optional
+      level: [1-255]                       # --> optional
 
   capabilities:
     matchCapabilities:
     - capability: [capability name]
       fromSource:
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
 
   action: [Audit|Block] (Block by default)
 ```
@@ -134,6 +141,17 @@ Now, we will briefly explain how to define a host security policy.
       kubernetes.io/os: [operating system, (e.g., linux)]
   ```
 
+  KubeArmor supports the following hostname label matching modes for Node/VM policies:
+
+  | Mode | Example | Description |
+  |---|---|---|
+  | Exact | `kubearmor.io/hostname: kubearmor-dev` | Targets a specific node by name |
+  | Wildcard | `kubearmor.io/hostname: "*"` | Targets all Nodes/VMs |
+  | Comma-separated | `kubernetes.io/hostname: node-1,node-2` | Targets multiple specific nodes |
+  | Regex | `kubearmor.io/hostnamereg: node-*` | Targets nodes whose hostname matches a pattern |
+
+  > **Note:** `kubernetes.io/` prefix variants are only available in Kubernetes environments. The `hostnamereg` label is supported with both `kubearmor.io/` and `kubernetes.io/` prefixes.
+
 * Process
 
   In the process section, there are three types of matches: matchPaths, matchDirectories, and matchPatterns. You can define specific executables using matchPaths or all executables in specific directories using matchDirectories. In the case of matchPatterns, advanced operators may be able to determine particular patterns for executables by using regular expressions. However, we generally do not recommend using this match.
@@ -150,7 +168,7 @@ Now, we will briefly explain how to define a host security policy.
         recursive: [true|false]            # --> optional
         ownerOnly: [true|false]            # --> optional
         fromSource:                        # --> optional
-        - path: [absolute exectuable path]
+        - path: [absolute executable path]
       matchPatterns:
       - pattern: [regex pattern]
         ownerOnly: [true|false]            # --> optional
@@ -221,6 +239,19 @@ Now, we will briefly explain how to define a host security policy.
         - path: [absolute file path]
   ```
 
+* Device
+
+  In the case of device, there is currently one match type: matchDevice. You can define specific USB device classes by class name or decimal/hex code, their corresponding sub classes, protocol and level of attachment. You can use `ALL` in class to match all USB device classes. A list of supported device class names is defined in [USB device class list](usb_device_handler.md), along with policy examples for some commonly used devices like keyboard, etc. Level matches the number of USB hub ancestors, for example 1 means attached directly to host, 2 means behind a hub and so on.
+
+  ```text
+    device:
+      matchDevice:
+      - class: [class name|decimal|hex]
+        subClass: [0-255]                   # --> optional
+        protocol: [0-255]                   # --> optional
+        level: [1-255]                      # --> optional
+  ```
+
 * Capabilities
 
   In the case of capabilities, there is currently one match type: matchCapabilities. You can define specific capability names to allow or block using matchCapabilities. You can check available capabilities in [Capability List](supported_capability_list.md).
@@ -236,27 +267,27 @@ Now, we will briefly explain how to define a host security policy.
 
   In the case of syscalls, there are two types of matches, matchSyscalls and matchPaths. matchPaths can be used to target system calls targeting specific binary path or anything under a specific directory, additionally you can slice based on syscalls generated by a binary or a group of binaries in a directory. You can use matchSyscall as a more general rule to match syscalls from all sources or from specific binaries.
 
-```
-syscalls:
-  matchSyscalls:
-  - syscall:
-    - syscallX
-    - syscallY
-    fromSource:                            # --> optional
-    - path: [absolute exectuable path]
-    - dir: [absolute directory path]
-      recursive: [true|false]              # --> optional
-  matchPaths:
-  - path: [absolute directory path | absolute exectuable path]
-    recursive: [true|false]                # --> optional
+  ```
+  syscalls:
+    matchSyscalls:
     - syscall:
       - syscallX
       - syscallY
-    fromSource:                            # --> optional
-    - path: [absolute exectuable path]
-    - dir: [absolute directory path]
-      recursive: [true|false]              # --> optional
-```
+      fromSource:                            # --> optional
+      - path: [absolute executable path]
+      - dir: [absolute directory path]
+        recursive: [true|false]              # --> optional
+    matchPaths:
+    - path: [absolute directory path | absolute executable path]
+      recursive: [true|false]                # --> optional
+      - syscall:
+        - syscallX
+        - syscallY
+      fromSource:                            # --> optional
+      - path: [absolute executable path]
+      - dir: [absolute directory path]
+        recursive: [true|false]              # --> optional
+  ```
 There is one options in each match.
 
   * fromSource

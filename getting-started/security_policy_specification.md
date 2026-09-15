@@ -12,7 +12,7 @@ metadata:
   namespace: [namespace name]
 
 spec:
-  severity: [1-10]                         # --> optional (1 by default)
+  severity: [1-10]                         # --> optional 
   tags: ["tag", ...]                       # --> optional
   message: [message]                       # --> optional
 
@@ -20,19 +20,24 @@ spec:
     matchLabels:
       [key1]: [value1]
       [keyN]: [valueN]
+    matchExpressions:
+      - key: [label]
+        operator: [In|NotIn]
+        values:
+          - [labels]
 
   process:
     matchPaths:
     - path: [absolute executable path]
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchDirectories:
     - dir: [absolute directory path]
       recursive: [true|false]              # --> optional
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchPatterns:
     - pattern: [regex pattern]
       ownerOnly: [true|false]              # --> optional
@@ -43,14 +48,14 @@ spec:
       readOnly: [true|false]               # --> optional
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchDirectories:
     - dir: [absolute directory path]
       recursive: [true|false]              # --> optional
       readOnly: [true|false]               # --> optional
       ownerOnly: [true|false]              # --> optional
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
     matchPatterns:
     - pattern: [regex pattern]
       readOnly: [true|false]               # --> optional
@@ -60,13 +65,13 @@ spec:
     matchProtocols:
     - protocol: [TCP|tcp|UDP|udp|ICMP|icmp]
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
 
   capabilities:
     matchCapabilities:
     - capability: [capability name]
       fromSource:                          # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
   
   syscalls:
     matchSyscalls:
@@ -74,17 +79,17 @@ spec:
       - syscallX
       - syscallY
       fromSource:                            # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
       - dir: [absolute directory path]
         recursive: [true|false]              # --> optional
     matchPaths:
-    - path: [absolute directory path | absolute exectuable path]
+    - path: [absolute directory path | absolute executable path]
       recursive: [true|false]                # --> optional
       - syscall:
         - syscallX
         - syscallY
       fromSource:                            # --> optional
-      - path: [absolute exectuable path]
+      - path: [absolute executable path]
       - dir: [absolute directory path]
         recursive: [true|false]              # --> optional
 
@@ -137,6 +142,8 @@ Now, we will briefly explain how to define a security policy.
 
 ### Selector
 
+#### MatchLabels
+
   The selector part is relatively straightforward. Similar to other Kubernetes configurations, you can specify \(a group of\) pods based on labels.
 
   ```text
@@ -145,6 +152,25 @@ Now, we will briefly explain how to define a security policy.
         [key1]: [value1]
         [keyN]: [valueN]
   ```
+
+  #### MatchExpressions
+  Further in selector we can use `matchExpressions` to define labels to select/deselect the workloads. Currently, only labels can be matched, so the key should be 'label'. The operator will determine whether the policy should apply to the workloads specified in the values field or not.
+
+  Operator: In
+  When the operator is set to In, the policy will be applied only to the workloads that match the labels in the values field.
+
+  Operator: NotIn
+  When the operator is set to NotIn, the policy will be applied to all the workloads except that match the labels in the values field.
+
+  ```text
+    selector:
+      matchExpressions:              
+        - key: label
+          operator: [In|NotIn]
+          values:
+          - [label]       # string format eg. -> (app=nginx)
+  ```
+  > **NOTE** Both `matchExpressions` and `matchLabel` are an ANDed operation.
 
 ### Process
 
@@ -162,7 +188,7 @@ Now, we will briefly explain how to define a security policy.
         recursive: [true|false]            # --> optional
         ownerOnly: [true|false]            # --> optional
         fromSource:                        # --> optional
-        - path: [absolute exectuable path]
+        - path: [absolute executable path]
       matchPatterns:
       - pattern: [regex pattern]
         ownerOnly: [true|false]            # --> optional
@@ -256,17 +282,17 @@ syscalls:
     - syscallX
     - syscallY
     fromSource:                            # --> optional
-    - path: [absolute exectuable path]
+    - path: [absolute executable path]
     - dir: [absolute directory path]
       recursive: [true|false]              # --> optional
   matchPaths:
-  - path: [absolute directory path | absolute exectuable path]
+  - path: [absolute directory path | absolute executable path]
     recursive: [true|false]                # --> optional
     - syscall:
       - syscallX
       - syscallY
     fromSource:                            # --> optional
-    - path: [absolute exectuable path]
+    - path: [absolute executable path]
     - dir: [absolute directory path]
       recursive: [true|false]              # --> optional
 ```

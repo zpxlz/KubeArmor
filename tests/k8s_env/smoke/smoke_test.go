@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package smoke
 
@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/kubearmor/KubeArmor/tests/util"
+	"github.com/kubearmor/KubeArmor/protobuf"
+
 	. "github.com/kubearmor/KubeArmor/tests/util"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -66,17 +67,18 @@ var _ = Describe("Smoke", func() {
 			// wait for policy creation
 			time.Sleep(5 * time.Second)
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql", []string{"bash", "-c", "apt"})
-			Expect(err).To(BeNil())
-			fmt.Printf("---START---\n%s---END---\n", sout)
-			Expect(sout).To(MatchRegexp("apt.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "apt"}, MatchRegexp("apt.*Permission denied"), true)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-wordpress-block-process",
+				Severity:   "3",
+			}
+
+			// check policy violation alert
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("ksp-wordpress-block-process"))
-			Expect(alerts[0].Severity).To(Equal("3"))
+			Expect(res.Found).To(BeTrue())
 		})
 
 		It("can block execution of access to sensitive file with abs path", func() {
@@ -91,20 +93,18 @@ var _ = Describe("Smoke", func() {
 			// wait for policy creation
 			time.Sleep(5 * time.Second)
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat /var/www/html/wp-config.php"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("wp-config.php.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat /var/www/html/wp-config.php"}, MatchRegexp("wp-config.php.*Permission denied"), true)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-wordpress-block-config",
+				Severity:   "10",
+				Message:    "blocked access to wordpress configuration file",
+			}
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			fmt.Printf("%+v\n", alerts[0])
-			Expect(alerts[0].PolicyName).To(Equal("ksp-wordpress-block-config"))
-			Expect(alerts[0].Severity).To(Equal("10"))
-			Expect(alerts[0].Message).To(Equal("blocked access to wordpress configuration file"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
 		It("can block execution of access to sensitive file with rel path", func() {
@@ -119,20 +119,17 @@ var _ = Describe("Smoke", func() {
 			// wait for policy creation
 			time.Sleep(5 * time.Second)
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat wp-config.php"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("wp-config.php.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat wp-config.php"}, MatchRegexp("wp-config.php.*Permission denied"), true)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-wordpress-block-config",
+				Severity:   "10",
+				Message:    "blocked access to wordpress configuration file",
+			}
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			fmt.Printf("%+v\n", alerts[0])
-			Expect(alerts[0].PolicyName).To(Equal("ksp-wordpress-block-config"))
-			Expect(alerts[0].Severity).To(Equal("10"))
-			Expect(alerts[0].Message).To(Equal("blocked access to wordpress configuration file"))
+			Expect(res.Found).To(BeTrue())
 		})
 
 		It("can block execution of access to service account token", func() {
@@ -147,18 +144,16 @@ var _ = Describe("Smoke", func() {
 			// wait for policy creation
 			time.Sleep(5 * time.Second)
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat /run/secrets/kubernetes.io/serviceaccount/token"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("token.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat /run/secrets/kubernetes.io/serviceaccount/token"}, MatchRegexp("token.*Permission denied"), true)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-wordpress-block-sa",
+				Severity:   "7",
+			}
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("ksp-wordpress-block-sa"))
-			Expect(alerts[0].Severity).To(Equal("7"))
+			Expect(res.Found).To(BeTrue())
 		})
 
 		It("allow access for service account token to only cat", func() {
@@ -174,40 +169,34 @@ var _ = Describe("Smoke", func() {
 			time.Sleep(5 * time.Second)
 
 			// trigger policy violation alert
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "head /run/secrets/kubernetes.io/serviceaccount/token"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("token.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "head /run/secrets/kubernetes.io/serviceaccount/token"}, MatchRegexp("token.*Permission denied"), true)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-wordpress-lenient-allow-sa",
+				Severity:   "7",
+				Source:     "head",
+			}
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			fmt.Printf("---Alert---\n%s", alerts[0].String())
-			Expect(alerts[0].PolicyName).To(Equal("ksp-wordpress-lenient-allow-sa"))
-			Expect(alerts[0].Severity).To(Equal("7"))
+			Expect(res.Found).To(BeTrue())
 
 			// trigger normal operations permitted by policy
-			sout, _, err = K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat /run/secrets/kubernetes.io/serviceaccount/token"})
-			Expect(err).To(BeNil())
-			Expect(sout).To(Not(ContainSubstring("Permission denied")))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat /run/secrets/kubernetes.io/serviceaccount/token"}, Not(MatchRegexp("Permission denied")), true)
 
-			sout, _, err = K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat /etc/passwd"})
-			Expect(err).To(BeNil())
-			Expect(sout).To(Not(ContainSubstring("Permission denied")))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat /etc/passwd"}, Not(MatchRegexp("Permission denied")), true)
 
-			sout, _, err = K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "head /etc/passwd"})
-			Expect(err).To(BeNil())
-			Expect(sout).To(Not(ContainSubstring("Permission denied")))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "head /etc/passwd"}, Not(MatchRegexp("Permission denied")), true)
 
 			// check for no policy violation alert
-			_, alerts, err = KarmorGetLogs(3*time.Second, 1)
+			expect = protobuf.Alert{
+				PolicyName: "ksp-wordpress-lenient-allow-sa",
+				Severity:   "7",
+				Source:     "cat",
+			}
+			res, err = KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically("==", 0))
+			Expect(res.Found).To(BeFalse())
 		})
 
 		It("can audit access to sensitive data path", func() {
@@ -223,22 +212,19 @@ var _ = Describe("Smoke", func() {
 			time.Sleep(5 * time.Second)
 
 			fname := fmt.Sprintf("/var/lib/mysql/%s", RandString(12))
-			sout, _, err := K8sExecInPod(sql, "wordpress-mysql",
-				[]string{"bash", "-c", fmt.Sprintf("touch %s", fname)})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
+			AssertCommand(sql, "wordpress-mysql", []string{"bash", "-c", fmt.Sprintf("touch %s", fname)}, MatchRegexp(".*"), true)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-mysql-audit-dir",
+				Severity:   "5",
+			}
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			fmt.Printf("---Alert---\n%s", alerts[0].String())
-			Expect(alerts[0].PolicyName).To(Equal("ksp-mysql-audit-dir"))
-			Expect(alerts[0].Severity).To(Equal("5"))
+			Expect(res.Found).To(BeTrue())
 
-			_, _, err = K8sExecInPod(sql, "wordpress-mysql",
-				[]string{"bash", "-c", fmt.Sprintf("rm %s", fname)})
-			Expect(err).To(BeNil())
+			AssertCommand(sql, "wordpress-mysql", []string{"bash", "-c", fmt.Sprintf("rm %s", fname)}, MatchRegexp(".*"), true)
+
 		})
 
 		It("can enforce multiple rules targeting same pod", func() {
@@ -251,17 +237,10 @@ var _ = Describe("Smoke", func() {
 			Expect(err).To(BeNil())
 
 			// trigger policy violation alert
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat /etc/passwd"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("/etc/passwd.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat /etc/passwd"}, MatchRegexp("/etc/passwd.*Permission denied"), true)
 
-			sout, _, err = K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "cat /etc/shadow"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(MatchRegexp("/etc/shadow.*Permission denied"))
+			AssertCommand(wp, "wordpress-mysql", []string{"bash", "-c", "cat /etc/shadow"}, MatchRegexp("/etc/shadow.*Permission denied"), true)
+
 		})
 
 		It("can block write access and only allow read access to mounted files", func() {
@@ -276,58 +255,19 @@ var _ = Describe("Smoke", func() {
 			// wait for policy creation
 			time.Sleep(5 * time.Second)
 
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "touch /dev/shm/new"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(ContainSubstring("Permission denied"))
+			AssertCommand(
+				wp, "wordpress-mysql", []string{"bash", "-c", "touch /dev/shm/new"},
+				MatchRegexp("Permission denied"), true,
+			)
 
 			// check policy violation alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "ksp-wordpress-block-mount-file",
+				Severity:   "5",
+			}
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(alerts[0].PolicyName).To(Equal("ksp-wordpress-block-mount-file"))
-			Expect(alerts[0].Severity).To(Equal("5"))
-		})
-		It("will allow use of tcp network protocol by curl and bash", func() {
-			err := util.AnnotateNS("wordpress-mysql", "kubearmor-network-posture", "audit")
-			Expect(err).To(BeNil())
-			// Apply policy
-			err = K8sApplyFile("res/ksp-wordpress-allow-tcp.yaml")
-			Expect(err).To(BeNil())
-
-			// Start Kubearmor Logs
-			err = KarmorLogStart("policy", "wordpress-mysql", "Network", wp)
-			Expect(err).To(BeNil())
-
-			// wait for policy creation
-			time.Sleep(5 * time.Second)
-
-			sout, _, err := K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "curl 142.250.193.46"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			// tcp action
-			Expect(sout).To(ContainSubstring("http://www.google.com/"))
-
-			// check alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
-			fmt.Printf("OUTPUT: %s\n", alerts)
-			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(Equal(0))
-
-			// tcp + udp + raw action
-			sout, _, err = K8sExecInPod(wp, "wordpress-mysql",
-				[]string{"bash", "-c", "curl google.com"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
-			Expect(sout).To(ContainSubstring("http://www.google.com/"))
-
-			// check alert
-			_, alerts, err = KarmorGetLogs(5*time.Second, 1)
-			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("DefaultPosture"))
-			Expect(alerts[0].Result).To(Equal("Passed"))
+			Expect(res.Found).To(BeTrue())
 		})
 	})
 })

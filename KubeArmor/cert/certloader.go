@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package cert is responsible for generating certs dynamically and loading the certs from external sources.
 package cert
@@ -82,12 +82,12 @@ type K8sCertLoader struct {
 	CertConfig CertConfig
 	K8sClient  *kubernetes.Clientset
 	Namespace  string
-	Secret     string
+	SecretName string
 }
 
 func (loader *K8sCertLoader) GetCertificateAndCaPool() (*tls.Certificate, *x509.CertPool, error) {
 	// load certificate from k8s secret
-	caCertBytes, err := ReadCertFromK8sSecret(loader.K8sClient, loader.Namespace, loader.Secret)
+	caCertBytes, err := ReadCertFromK8sSecret(loader.K8sClient, loader.Namespace, loader.SecretName)
 	if err != nil {
 		return nil, nil, err
 	}

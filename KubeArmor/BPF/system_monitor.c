@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright 2022 Authors of KubeArmor */
+/* Copyright 2026 Authors of KubeArmor */
 
 #ifndef KBUILD_MODNAME
 #define KBUILD_MODNAME "kubearmor_system_monitor"
@@ -21,17 +21,23 @@
 #pragma clang diagnostic ignored "-Wunused-label"
 #endif
 
+#ifndef volatile_reg
+/* Prevent 64-bit stack spill of u32 that causes BPF verifier to lose
+ * bounds tracking on kernels 5.4 */
+#define volatile_reg(var) asm volatile("" : "+r"(var))
+#endif
+
 #ifdef BTF_SUPPORTED
 #include "vmlinux.h"
 #include "vmlinux_macro.h"
 #include <bpf_core_read.h>
 #define __user
 #else
-#include <linux/nsproxy.h>
+#include <linux/nsproxy.h> // struct nsproxy
 #include <linux/ns_common.h>
 #include <linux/pid_namespace.h>
 #include <linux/proc_ns.h>
-#include <linux/mount.h>
+#include <linux/mount.h> // struct vfsmount
 #include <linux/binfmts.h>
 
 #include <linux/un.h>
@@ -48,7 +54,11 @@
 #include <bpf_tracing.h>
 #include "syscalls.h"
 #include "throttling.h"
-
+#include "ima_hash.h"
+#include "kubearmor_config.h"
+#include "visibility.h"
+#include "kernel_helpers.h"
+#include "arg_matching_helpers.h"
 
 #ifdef RHEL_RELEASE_CODE
 #if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8, 0))
@@ -59,13 +69,6 @@
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 #error Minimal required kernel version is 4.14
 #endif
-
-#undef container_of
-#define container_of(ptr, type, member)                    \
-    ({                                                     \
-        const typeof(((type *)0)->member) *__mptr = (ptr); \
-        (type *)((char *)__mptr - offsetof(type, member)); \
-    })
 
 // == Structures == //
 
@@ -92,6 +95,16 @@
 #define PTRACE_REQ_T 23UL
 #define MOUNT_FLAG_T 24UL
 #define UMOUNT_FLAG_T 25UL
+#define UDP_MSG 26UL
+#define QTYPE 27UL
+
+// types for ima hash
+#define PHASH 30
+#define PPHASH 31
+#define FHASH 32
+
+#define MAX_LABELS 10 // max labels in domain name
+#define MAX_LABEL_LEN 63
 
 #define MAX_ARGS 6
 #define ENC_ARG_TYPE(n, type) type << (8 * n)
@@ -111,6 +124,14 @@
 #define PT_REGS_PARM6(x) ((x)->r9)
 #elif defined(bpf_target_arm64)
 #define PT_REGS_PARM6(x) ((x)->regs[5])
+#endif
+
+#ifndef ntohs
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define ntohs(x) __builtin_bswap16(x)
+#else
+#define ntohs(x) (x)
+#endif
 #endif
 
 #define UNDEFINED_SYSCALL 1000
@@ -184,27 +205,17 @@ enum
     _TCP_ACCEPT = 401,
     _TCP_CONNECT_v6 = 402,
     _TCP_ACCEPT_v6 = 403,
+
+    // UDP_MSG
+    _UDP_SENDMSG = 10000,
+    _UDP_SEND_SKB = 10001
 };
 
+// forward declartaion for CWD
 #ifndef BTF_SUPPORTED
-struct mnt_namespace
+struct fs_struct
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
-    atomic_t count;
-#endif
-    struct ns_common ns;
-};
-
-struct fs_struct {
-	struct path pwd;
-};
-
-struct mount
-{
-    struct hlist_node mnt_hash;
-    struct mount *mnt_parent;
-    struct dentry *mnt_mountpoint;
-    struct vfsmount mnt;
+    struct path pwd;
 };
 #endif
 
@@ -230,15 +241,19 @@ typedef struct __attribute__((__packed__)) sys_context
     char cwd[CWD_LEN];
     char tty[TTY_LEN];
     u32 oid; // owner id
+    // exec event will have non-zero execID
+    u64 exec_id;
+    u8 hash;
 } sys_context_t;
 
 #define BPF_MAP(_name, _type, _key_type, _value_type, _max_entries) \
-    struct {                                                        \
-  __uint(type, _type);                                              \
-  __type(key, _key_type);                                           \
-  __type(value, _value_type);                                       \
-  __uint(max_entries, _max_entries);                                \
-} _name SEC(".maps");                                              
+    struct                                                          \
+    {                                                               \
+        __uint(type, _type);                                        \
+        __type(key, _key_type);                                     \
+        __type(value, _value_type);                                 \
+        __uint(max_entries, _max_entries);                          \
+    } _name SEC(".maps");
 
 #define BPF_HASH(_name, _key_type, _value_type) \
     BPF_MAP(_name, BPF_MAP_TYPE_HASH, _key_type, _value_type, 10240)
@@ -259,6 +274,24 @@ typedef struct __attribute__((__packed__)) sys_context
     BPF_MAP(_name, BPF_MAP_TYPE_PERF_EVENT_ARRAY, int, __u32, 1024)
 
 BPF_LRU_HASH(pid_ns_map, u32, u32);
+
+typedef struct args
+{
+    unsigned long args[6];
+} args_t;
+
+BPF_LRU_HASH(args_map, u64, args_t);
+BPF_LRU_HASH(file_map, u64, struct path);
+
+typedef struct buffers
+{
+    u8 buf[MAX_BUFFER_SIZE];
+} bufs_t;
+
+BPF_PERCPU_ARRAY(bufs, bufs_t, 5);
+BPF_PERCPU_ARRAY(bufs_offset, u32, 5);
+
+BPF_PERF_OUTPUT(sys_events);
 
 #ifdef BTF_SUPPORTED
 #define GET_FIELD_ADDR(field) __builtin_preserve_access_index(&field)
@@ -282,171 +315,33 @@ BPF_LRU_HASH(pid_ns_map, u32, u32);
     })
 #endif
 
-typedef struct args
+// exec maps
+BPF_LRU_HASH(ns_transition, u32, struct outer_key);
+
+struct exec_pid_map
 {
-    unsigned long args[6];
-} args_t;
-
-BPF_LRU_HASH(args_map, u64, args_t);
-BPF_LRU_HASH(file_map, u64, struct path);
-
-typedef struct buffers
-{
-    u8 buf[MAX_BUFFER_SIZE];
-} bufs_t;
-
-BPF_PERCPU_ARRAY(bufs, bufs_t, 4);
-BPF_PERCPU_ARRAY(bufs_offset, u32, 4);
-
-BPF_PERF_OUTPUT(sys_events);
-
-// == Visibility == //
-
-enum
-{
-    _FILE_PROBE = 0,
-    _PROCESS_PROBE = 1,
-    _NETWORK_PROBE = 2,
-    _CAPS_PROBE = 3,
-
-    _TRACE_SYSCALL = 0,
-    _IGNORE_SYSCALL = 1,
-};
-
-struct visibility
-{
-    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __type(key, struct outer_key);
-    __type(value, u32);
-    /*
-        https://github.com/kubernetes/community/blob/master/sig-scalability/configs-and-limits/thresholds.md#kubernetes-thresholds
-        The link above mentions that a node can have a maximun of 110 pods.
-    */
-    __uint(max_entries, 65535);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-};
-
-struct visibility kubearmor_visibility SEC(".maps");
-
-#define DEFAULT_VISIBILITY_KEY 0xc0ffee
-
-// == Config == //
-
-enum
-{
-    _MONITOR_HOST = 0,
-    _MONITOR_CONTAINER = 1,
-    _ENFORCER_BPFLSM = 2,
-    _ALERT_THROTTLING = 3,
-    _MAX_ALERT_PER_SEC = 4,
-    _THROTTLE_SEC = 5,
-};
-
-struct kaconfig
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, u32);
-    __type(value, u32);
-    __uint(max_entries, 16);
+    __type(value, u64);
+    __uint(max_entries, 10240);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 };
 
-struct kaconfig kubearmor_config SEC(".maps");
+struct exec_pid_map kubearmor_exec_pids SEC(".maps");
 
-// == Kernel Helpers == //
-
-static __always_inline u32 get_pid_ns_id(struct nsproxy *ns)
+struct pathname_t
 {
-    struct pid_namespace *pidns = READ_KERN(ns->pid_ns_for_children);
-    return READ_KERN(pidns->ns.inum);
-}
+    char path[256];
+};
 
-static __always_inline u32 get_mnt_ns_id(struct nsproxy *ns)
+struct
 {
-    struct mnt_namespace *mntns = READ_KERN(ns->mnt_ns);
-    return READ_KERN(mntns->ns.inum);
-}
-
-static inline struct mount *real_mount(struct vfsmount *mnt)
-{
-    return container_of(mnt, struct mount, mnt);
-}
-
-static __always_inline u32 get_task_pid_ns_id(struct task_struct *task)
-{
-    return get_pid_ns_id(READ_KERN(task->nsproxy));
-}
-
-static __always_inline u32 get_task_mnt_ns_id(struct task_struct *task)
-{
-    return get_mnt_ns_id(READ_KERN(task->nsproxy));
-}
-
-static __always_inline u32 get_task_pid_vnr(struct task_struct *task)
-{
-    struct pid *pid = NULL;
-
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0) && !defined(RHEL_RELEASE_GT_8_0) && !defined(BTF_SUPPORTED))
-    pid = READ_KERN(task->pids[PIDTYPE_PID].pid);
-#else
-    pid = READ_KERN(task->thread_pid);
-#endif
-
-    unsigned int level = READ_KERN(pid->level);
-    return READ_KERN(pid->numbers[level].nr);
-}
-
-static __always_inline u32 get_task_ns_tgid(struct task_struct *task)
-{
-    struct task_struct *group_leader = READ_KERN(task->group_leader);
-    return get_task_pid_vnr(group_leader);
-}
-
-static __always_inline u32 get_task_ns_pid(struct task_struct *task)
-{
-    return get_task_pid_vnr(task);
-}
-
-static __always_inline u32 get_task_ns_ppid(struct task_struct *task)
-{
-    struct task_struct *real_parent = READ_KERN(task->real_parent);
-    return get_task_pid_vnr(real_parent);
-}
-
-static __always_inline u32 get_task_ppid(struct task_struct *task)
-{
-    struct task_struct *parent = READ_KERN(task->parent);
-    return READ_KERN(parent->pid);
-}
-
-static struct file *get_task_file(struct task_struct *task)
-{
-    struct mm_struct *mm = READ_KERN(task->mm);
-    return READ_KERN(mm->exe_file);
-}
-
-static __always_inline void get_outer_key(struct outer_key *pokey,
-                                          struct task_struct *t)
-{
-    pokey->pid_ns = get_task_pid_ns_id(t);
-    pokey->mnt_ns = get_task_mnt_ns_id(t);
-    if (pokey->pid_ns == PROC_PID_INIT_INO)
-    {
-        pokey->pid_ns = 0;
-        pokey->mnt_ns = 0;
-    }
-}
-
-static __always_inline u32 get_kubearmor_config(u32 config)
-{
-    u32 *value = bpf_map_lookup_elem(&kubearmor_config, &config);
-    if (!value)
-    {
-        return 0;
-    }
-
-    return *value;
-}
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, u64);
+    __type(value, struct pathname_t);
+    __uint(max_entries, 1024);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} proc_file_access SEC(".maps");
 
 // == Pid NS Management == //
 
@@ -466,14 +361,14 @@ static __always_inline u32 add_pid_ns()
 
         return pid;
     }
-    else if(get_kubearmor_config(_MONITOR_CONTAINER))
+    else if (get_kubearmor_config(_MONITOR_CONTAINER))
     { // container
         if (!bpf_map_lookup_elem(&pid_ns_map, &pid_ns))
         {
             // untracked pid ns, adding to pid ns map
             bpf_map_update_elem(&pid_ns_map, &pid_ns, &one, BPF_ANY);
         }
-        
+
         return pid_ns;
     }
 
@@ -494,15 +389,14 @@ static __always_inline u32 remove_pid_ns()
             return 0;
         }
     }
-    else if(get_kubearmor_config(_MONITOR_CONTAINER))
+    else if (get_kubearmor_config(_MONITOR_CONTAINER))
     { // container
         if (get_task_ns_pid(task) == 1)
         {
             u32 mnt_ns = get_task_mnt_ns_id(task);
             struct outer_key key = {
                 .pid_ns = pid_ns,
-                .mnt_ns = mnt_ns
-            };
+                .mnt_ns = mnt_ns};
             bpf_map_delete_elem(&kubearmor_alert_throttle, &key);
             bpf_map_delete_elem(&pid_ns_map, &pid_ns);
             return 0;
@@ -510,47 +404,6 @@ static __always_inline u32 remove_pid_ns()
     }
 
     return 0;
-}
-
-static __always_inline u32 drop_syscall(u32 scope)
-{
-    struct outer_key okey;
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    get_outer_key(&okey, task);
-
-    // We try check global config to check if lookup for container fails do we need to ignore or trace a syscall
-    // In case lookup for global config fails we continue the container check 
-    // and choose to not drop events if either of them are not found
-
-    u32 default_trace = _TRACE_SYSCALL;
-    struct outer_key defaultvizkey;
-    defaultvizkey.pid_ns = DEFAULT_VISIBILITY_KEY;
-    defaultvizkey.mnt_ns = DEFAULT_VISIBILITY_KEY;
-    u32 *d_visibility = bpf_map_lookup_elem(&kubearmor_visibility, &defaultvizkey);
-    if (d_visibility) {
-        u32 *d_on_off_switch = bpf_map_lookup_elem(d_visibility, &scope);
-        if (d_on_off_switch)
-            if (*d_on_off_switch)
-                default_trace = _IGNORE_SYSCALL;
-    }
-
-
-    u32 *ns_visibility = bpf_map_lookup_elem(&kubearmor_visibility, &okey);
-    if (!ns_visibility)
-    {
-        return default_trace;
-    }
-
-    u32 *on_off_switch = bpf_map_lookup_elem(ns_visibility, &scope);
-    if (!on_off_switch)
-    {
-        return default_trace;
-    }
-
-    if (*on_off_switch)
-        return _IGNORE_SYSCALL;
-
-    return _TRACE_SYSCALL;
 }
 
 static __always_inline u32 skip_syscall()
@@ -566,7 +419,7 @@ static __always_inline u32 skip_syscall()
             return !add_pid_ns();
         }
     }
-    else if(get_kubearmor_config(_MONITOR_CONTAINER))
+    else if (get_kubearmor_config(_MONITOR_CONTAINER))
     { // container
         if (bpf_map_lookup_elem(&pid_ns_map, &pid_ns) == 0)
         {
@@ -583,6 +436,7 @@ static __always_inline u32 skip_syscall()
 #define EXEC_BUF_TYPE 1
 #define FILE_BUF_TYPE 2
 #define CWD_BUF_TYPE 3
+#define DNS_BUF_TYPE 4
 
 static __always_inline bufs_t *get_buffer(int buf_type)
 {
@@ -611,46 +465,74 @@ static __always_inline int save_context_to_buffer(bufs_t *bufs_p, void *ptr)
 
 static __always_inline int save_str_to_buffer(bufs_t *bufs_p, void *ptr)
 {
-
     u32 *off = get_buffer_offset(DATA_BUF_TYPE);
-
     if (off == NULL)
     {
         return -1;
     }
 
-    if (*off > MAX_BUFFER_SIZE - MAX_STRING_SIZE - sizeof(int))
+    if (*off >= MAX_BUFFER_SIZE)
     {
-        return 0; // no enough space
+        return 0;
     }
 
-    u8 type = STR_T;
-    bpf_probe_read(&(bufs_p->buf[*off & (MAX_BUFFER_SIZE - 1)]), 1, &type);
-
-    *off += 1;
-
-    if (*off > MAX_BUFFER_SIZE - MAX_STRING_SIZE - sizeof(int))
+    u32 type_pos = *off;
+    if (type_pos >= MAX_BUFFER_SIZE || type_pos + sizeof(u8) >= MAX_BUFFER_SIZE)
     {
-        return 0; // no enough space
+        return 0;
     }
 
-    int sz = bpf_probe_read_str(&(bufs_p->buf[*off + sizeof(int)]), MAX_STRING_SIZE, ptr);
-    if (sz > 0)
+    u32 size_pos = type_pos + 1;
+    if (size_pos >= MAX_BUFFER_SIZE ||
+        size_pos + sizeof(int) > MAX_BUFFER_SIZE)
     {
-        if (*off > MAX_BUFFER_SIZE - sizeof(int))
-        {
-            return 0; // no enough space
-        }
-
-        bpf_probe_read(&(bufs_p->buf[*off]), sizeof(int), &sz);
-
-        *off += sz + sizeof(int);
-        set_buffer_offset(DATA_BUF_TYPE, *off);
-
-        return sz + sizeof(int);
+        return 0;
     }
 
-    return 0;
+    u8 type_val = STR_T;
+    if (bpf_probe_read(&(bufs_p->buf[type_pos]), sizeof(u8), &type_val) < 0)
+    {
+        return 0;
+    }
+
+    u32 str_pos = size_pos + sizeof(int);
+    if (str_pos >= MAX_BUFFER_SIZE - 1 || str_pos + MAX_STRING_SIZE > MAX_BUFFER_SIZE - 1)
+    {
+        return 0;
+    }
+
+    u32 remaining_space = MAX_BUFFER_SIZE - str_pos;
+    u32 read_size = remaining_space;
+    if (read_size > MAX_STRING_SIZE)
+    {
+        read_size = MAX_STRING_SIZE;
+    }
+
+    if (read_size < MAX_STRING_SIZE)
+    {
+        return 0;
+    }
+
+    int sz = bpf_probe_read_str(&(bufs_p->buf[str_pos]), read_size, ptr);
+    if (sz <= 0)
+    {
+        return 0;
+    }
+
+    if (bpf_probe_read(&(bufs_p->buf[size_pos]), sizeof(int), &sz) < 0)
+    {
+        return 0;
+    }
+
+    u32 new_off = str_pos + sz;
+    if (new_off > MAX_BUFFER_SIZE)
+    {
+        return 0;
+    }
+
+    set_buffer_offset(DATA_BUF_TYPE, new_off);
+
+    return sz + sizeof(int);
 }
 
 static __always_inline bool prepend_path(struct path *path, bufs_t *string_p, int buf_type)
@@ -762,7 +644,7 @@ static __always_inline int save_file_to_buffer(bufs_t *bufs_p, void *ptr)
     return save_str_to_buffer(bufs_p, (void *)&string_p->buf[*off]);
 }
 
-static __always_inline int save_to_buffer(bufs_t *bufs_p, void *ptr, int size, u8 type)
+static __always_inline int save_to_buffer(bufs_t *bufs_p, int buf_type, void *ptr, int size, u8 type)
 {
 // the biggest element that can be saved with this function should be defined here
 #define MAX_ELEMENT_SIZE sizeof(struct sockaddr_un)
@@ -772,7 +654,7 @@ static __always_inline int save_to_buffer(bufs_t *bufs_p, void *ptr, int size, u
         return 0;
     }
 
-    u32 *off = get_buffer_offset(DATA_BUF_TYPE);
+    u32 *off = get_buffer_offset(buf_type);
     if (off == NULL)
     {
         return -1;
@@ -798,7 +680,7 @@ static __always_inline int save_to_buffer(bufs_t *bufs_p, void *ptr, int size, u
     if (bpf_probe_read(&(bufs_p->buf[*off]), size, ptr) == 0)
     {
         *off += size;
-        set_buffer_offset(DATA_BUF_TYPE, *off);
+        set_buffer_offset(buf_type, *off);
         return size;
     }
 
@@ -820,7 +702,7 @@ static __always_inline int save_argv(bufs_t *bufs_p, void *ptr)
 
 static __always_inline int save_str_arr_to_buffer(bufs_t *bufs_p, const char __user *const __user *ptr)
 {
-    save_to_buffer(bufs_p, NULL, 0, STR_ARR_T);
+    save_to_buffer(bufs_p, DATA_BUF_TYPE, NULL, 0, STR_ARR_T);
 
 #pragma unroll
     for (int i = 0; i < MAX_STR_ARR_ELEM; i++)
@@ -835,7 +717,7 @@ static __always_inline int save_str_arr_to_buffer(bufs_t *bufs_p, const char __u
     save_str_to_buffer(bufs_p, (void *)ellipsis);
 
 out:
-    save_to_buffer(bufs_p, NULL, 0, STR_ARR_T);
+    save_to_buffer(bufs_p, DATA_BUF_TYPE, NULL, 0, STR_ARR_T);
 
     return 0;
 }
@@ -861,31 +743,31 @@ static __always_inline int save_args_to_buffer(u64 types, args_t *args)
         case NONE_T:
             break;
         case INT_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), INT_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), INT_T);
             break;
         case OPEN_FLAGS_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), OPEN_FLAGS_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), OPEN_FLAGS_T);
             break;
         case FILE_TYPE_T:
             save_file_to_buffer(bufs_p, (void *)args->args[i]);
             break;
         case PTRACE_REQ_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), PTRACE_REQ_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), PTRACE_REQ_T);
             break;
         case MOUNT_FLAG_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), MOUNT_FLAG_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), MOUNT_FLAG_T);
             break;
         case UMOUNT_FLAG_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), UMOUNT_FLAG_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), UMOUNT_FLAG_T);
             break;
         case STR_T:
             save_str_to_buffer(bufs_p, (void *)args->args[i]);
             break;
         case SOCK_DOM_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), SOCK_DOM_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), SOCK_DOM_T);
             break;
         case SOCK_TYPE_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), SOCK_TYPE_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), SOCK_TYPE_T);
             break;
         case SOCKADDR_T:
             if (args->args[i])
@@ -895,21 +777,21 @@ static __always_inline int save_args_to_buffer(u64 types, args_t *args)
                 switch (family)
                 {
                 case AF_UNIX:
-                    save_to_buffer(bufs_p, (void *)(args->args[i]), sizeof(struct sockaddr_un), SOCKADDR_T);
+                    save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)(args->args[i]), sizeof(struct sockaddr_un), SOCKADDR_T);
                     break;
                 case AF_INET:
-                    save_to_buffer(bufs_p, (void *)(args->args[i]), sizeof(struct sockaddr_in), SOCKADDR_T);
+                    save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)(args->args[i]), sizeof(struct sockaddr_in), SOCKADDR_T);
                     break;
                 case AF_INET6:
-                    save_to_buffer(bufs_p, (void *)(args->args[i]), sizeof(struct sockaddr_in6), SOCKADDR_T);
+                    save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)(args->args[i]), sizeof(struct sockaddr_in6), SOCKADDR_T);
                     break;
                 default:
-                    save_to_buffer(bufs_p, (void *)&family, sizeof(short), SOCKADDR_T);
+                    save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&family, sizeof(short), SOCKADDR_T);
                 }
             }
             break;
         case UNLINKAT_FLAG_T:
-            save_to_buffer(bufs_p, (void *)&(args->args[i]), sizeof(int), UNLINKAT_FLAG_T);
+            save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&(args->args[i]), sizeof(int), UNLINKAT_FLAG_T);
             break;
         }
     }
@@ -917,13 +799,125 @@ static __always_inline int save_args_to_buffer(u64 types, args_t *args)
     return 0;
 }
 
-static __always_inline int events_perf_submit(struct pt_regs *ctx)
+static __always_inline int save_dns_data_to_dns_buffer(bufs_t *bufs_p, void *base, u8 type)
 {
-    bufs_t *bufs_p = get_buffer(DATA_BUF_TYPE);
+// |  1B  |      4B     | 255B  |  1B  |   2B  |
+// | TYPE | SIZE_OF_INT | QNAME | TYPE | QTYPE |
+#define MAX_DNS_Q_NAME_SIZE 264
+    u32 *off = get_buffer_offset(DNS_BUF_TYPE);
+    if (off == NULL)
+    {
+        return -1;
+    }
+
+    if (*off > MAX_BUFFER_SIZE - MAX_DNS_Q_NAME_SIZE)
+    {
+        return -1;
+    }
+
+    if (bpf_probe_read(&(bufs_p->buf[*off]), 1, &type) != 0)
+    {
+        return -1;
+    }
+
+    *off += 1;
+
+    u32 size_off = *off;
+    *off += sizeof(int);
+    // header offset
+    // 0----------15--------31
+    // _______________________
+    // | id       | flags    |
+    // -----------------------
+    // | q_count  | a_count  |
+    // -----------------------
+    // | ns_count | ar_count |
+    // -----------------------
+    __u8 header_off = 12;
+    // https://stackoverflow.com/a/32294443
+    // question(s)
+    // RFC1035 maxed to 255 Bytes
+    // LL: Label length, LN: Label Name, NL: Null Label
+    // LL (1) + LN (63) + LL (1) + LN (63) + LL (1) + LN (63) LL (1) + LN (61) + NL (1)
+    int offset = header_off; // initial offset in the data stream
+#pragma unroll
+    for (int i = 0; i < MAX_LABELS; i++)
+    {
+        u8 len = 0;
+        if (bpf_probe_read(&len, sizeof(len), base + offset) < 0)
+            return -1;
+
+        if (len == 0)
+        {
+            if (*off < MAX_BUFFER_SIZE - MAX_DNS_Q_NAME_SIZE)
+                bufs_p->buf[*off] = '\0';
+            break;
+        }
+
+        if (len > MAX_LABEL_LEN)
+            return -1;
+
+        if (*off > MAX_BUFFER_SIZE - MAX_DNS_Q_NAME_SIZE)
+        {
+            return -1;
+        }
+
+        if (bpf_probe_read(&bufs_p->buf[*off], len, base + offset + 1) < 0)
+            return -1;
+
+        *off += len;
+        if (*off < MAX_BUFFER_SIZE - MAX_DNS_Q_NAME_SIZE)
+        {
+            bufs_p->buf[*off] = 0x2E; // "." char
+            *off += 1;
+        }
+        set_buffer_offset(DNS_BUF_TYPE, *off);
+        offset += len + 1;
+    }
+
+    // should never be the case
+    if (size_off >= MAX_BUFFER_SIZE ||
+        size_off + sizeof(int) > MAX_BUFFER_SIZE)
+    {
+        return -1;
+    }
+    int size = *off - size_off - sizeof(int) + 1;
+    if (bpf_probe_read(&(bufs_p->buf[size_off]), sizeof(int), &size) < 0)
+    {
+        return -1;
+    }
+
+    // setting offset to next byte to null char
+    *off += 1;
+    u32 q_type_off = *off;
+    if (q_type_off > MAX_BUFFER_SIZE - 1)
+        return -1;
+
+    __u8 qtype = QTYPE;
+    // type for qtype
+    if (bpf_probe_read(&(bufs_p->buf[q_type_off]), 1, &qtype) < 0)
+        return -1;
+
+    *off += 1;
+    q_type_off = *off;
+    if (q_type_off > MAX_BUFFER_SIZE - 2)
+        return -1;
+
+    // write qtype to buffer
+    if (bpf_probe_read(&(bufs_p->buf[q_type_off]), 2, base + offset + 1) < 0)
+        return -1;
+    *off += 2;
+    set_buffer_offset(DNS_BUF_TYPE, *off);
+    return 0;
+}
+
+static __always_inline int events_perf_submit(struct pt_regs *ctx, int buf_type)
+{
+    bufs_t *bufs_p = get_buffer(buf_type);
     if (bufs_p == NULL)
         return -1;
 
-    u32 *off = get_buffer_offset(DATA_BUF_TYPE);
+    u32 *off = get_buffer_offset(buf_type);
     if (off == NULL)
         return -1;
 
@@ -931,6 +925,119 @@ static __always_inline int events_perf_submit(struct pt_regs *ctx)
     int size = *off & (MAX_BUFFER_SIZE - 1);
 
     return bpf_perf_event_output(ctx, &sys_events, BPF_F_CURRENT_CPU, data, size);
+}
+
+static __always_inline int save_hash_to_buffer(bufs_t *bufs_p, u32 type)
+{
+
+// ---------------
+// | type | hash | => 4 + 32
+// ---------------
+#define MAX_HASH_DATA_SIZE 36
+    u32 *off = get_buffer_offset(DATA_BUF_TYPE);
+    if (off == NULL)
+    {
+        return -1;
+    }
+
+    __u32 id = 0;
+
+    if (type == PHASH)
+    {
+        id = bpf_get_current_pid_tgid() >> 32;
+    }
+    else if (type == PPHASH)
+    {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        id = get_task_ppid(task);
+    }
+    else if (type == FHASH)
+    {
+        id = bpf_get_current_pid_tgid() >> 32;
+        id |= FILE_HASH_MASK;
+    }
+    else
+    {
+        return -1;
+    }
+
+    if (*off > MAX_BUFFER_SIZE - MAX_HASH_DATA_SIZE)
+    {
+        return -1;
+    }
+
+    if (*off + 4 > MAX_BUFFER_SIZE - MAX_HASH_DATA_SIZE)
+        return -1;
+
+    if (bpf_probe_read(&(bufs_p->buf[*off]), sizeof(int), &type) != 0)
+    {
+        return -1;
+    }
+
+    *off += sizeof(int);
+
+    ima_hash_t_p hash = bpf_map_lookup_elem(&kubearmor_ima_hash_map, &id);
+
+    if (!hash)
+    {
+        return -1;
+    }
+
+    if (*off + sizeof(hash->digest) > MAX_BUFFER_SIZE - MAX_HASH_DATA_SIZE)
+    {
+        return -1;
+    }
+
+    if (bpf_probe_read(&(bufs_p->buf[*off]), sizeof(hash->digest), hash->digest) < 0)
+        return -1;
+    *off += sizeof(hash->digest);
+    return 0;
+}
+
+static __always_inline int save_all_hashes_to_the_buffer(bufs_t *bufs_p, bool addFileHash)
+{
+    // |-----------------------------------------------|
+    // | no. of hashes | type | hash |...| type | hash |
+    // |-----------------------------------------------|
+
+    u32 *off = get_buffer_offset(DATA_BUF_TYPE);
+    if (off == NULL)
+    {
+        return -1;
+    }
+    u32 num_of_hashes_idx = *off;
+
+    u8 num_of_hashes = 0;
+    *off += sizeof(num_of_hashes);
+
+    if (save_hash_to_buffer(bufs_p, PHASH) == 0)
+    {
+        num_of_hashes += 1;
+    }
+
+    if (save_hash_to_buffer(bufs_p, PPHASH) == 0)
+    {
+        num_of_hashes += 1;
+    }
+
+    if (addFileHash && save_hash_to_buffer(bufs_p, FHASH) == 0)
+    {
+        num_of_hashes += 1;
+    }
+
+    if (num_of_hashes_idx >= MAX_BUFFER_SIZE || num_of_hashes_idx + num_of_hashes >= MAX_BUFFER_SIZE)
+        return -1;
+
+    u32 idx = num_of_hashes_idx;
+    volatile_reg(idx);
+    idx &= (MAX_BUFFER_SIZE - 1);
+
+    if (bpf_probe_read(&(bufs_p->buf[idx]), sizeof(u8), &num_of_hashes) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
 // == Full Path == //
@@ -981,10 +1088,12 @@ static __always_inline u32 init_context(sys_context_t *context)
 {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
+    __builtin_memset((void *)&context->exec_id, 0, sizeof(context->exec_id));
     context->ts = bpf_ktime_get_ns();
 
     context->host_ppid = get_task_ppid(task);
-    context->host_pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 host_pid = bpf_get_current_pid_tgid() >> 32;
+    context->host_pid = host_pid;
 
     u32 pid = get_task_ns_tgid(task);
     if (context->host_pid == pid)
@@ -1002,6 +1111,13 @@ static __always_inline u32 init_context(sys_context_t *context)
 
         context->ppid = get_task_ns_ppid(task);
         context->pid = pid;
+
+        // check if process is part of exec
+        u64 *exec_id = bpf_map_lookup_elem(&kubearmor_exec_pids, &host_pid);
+        if (exec_id)
+        {
+            context->exec_id = *exec_id;
+        }
     }
 
     context->uid = bpf_get_current_uid_gid();
@@ -1011,15 +1127,17 @@ static __always_inline u32 init_context(sys_context_t *context)
     // check if tty is attached
     struct signal_struct *signal;
     signal = READ_KERN(task->signal);
-    if (signal != NULL){
+    if (signal != NULL)
+    {
         struct tty_struct *tty = READ_KERN(signal->tty);
-        if (tty != NULL){
+        if (tty != NULL)
+        {
             // a tty is attached
             bpf_probe_read_str(&context->tty, TTY_LEN, (void *)tty->name);
         }
     }
 
-#if (defined(BTF_SUPPORTED))
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 2, 0) // min version that supports 1 million instructions
     struct fs_struct *fs;
     fs = READ_KERN(task->fs);
     struct path path = READ_KERN(fs->pwd);
@@ -1041,26 +1159,33 @@ static __always_inline u32 init_context(sys_context_t *context)
 #endif
     return 0;
 }
-
 // == Alert Throttling == //
 
 // To check if subsequent alerts should be dropped per container
-static __always_inline bool should_drop_alerts_per_container(sys_context_t *context, struct pt_regs *ctx, u32 types, args_t *args) {
+static __always_inline bool should_drop_alerts_per_container(sys_context_t *context, struct pt_regs *ctx, u32 types, args_t *args)
+{
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 2, 0)
+
+    // throttling for host in case of apparmor is handled in userspace
+    if (context->pid_id == 0 && context->mnt_id == 0)
+    {
+        return false;
+    }
+
     u64 current_timestamp = bpf_ktime_get_ns();
 
     struct outer_key key = {
         .pid_ns = context->pid_id,
-        .mnt_ns = context->mnt_id
-    };
+        .mnt_ns = context->mnt_id};
 
     struct alert_throttle_state *state = bpf_map_lookup_elem(&kubearmor_alert_throttle, &key);
 
-    if (!state) {
+    if (!state)
+    {
         struct alert_throttle_state new_state = {
             .event_count = 1,
             .first_event_timestamp = current_timestamp,
-            .throttle = 0
-        };
+            .throttle = 0};
 
         bpf_map_update_elem(&kubearmor_alert_throttle, &key, &new_state, BPF_ANY);
         return false;
@@ -1070,49 +1195,187 @@ static __always_inline bool should_drop_alerts_per_container(sys_context_t *cont
     u64 throttle_nsec = throttle_sec * 1000000000L;
     u64 max = (u64)get_kubearmor_config(_MAX_ALERT_PER_SEC);
 
-    if (state->throttle) {
+    if (state->throttle)
+    {
         u64 time_difference = current_timestamp - state->first_event_timestamp;
-        if (time_difference < throttle_nsec) {
+        if (time_difference < throttle_nsec)
+        {
             return true;
-        }  
+        }
     }
 
     u64 time_difference = current_timestamp - state->first_event_timestamp;
 
-    if (time_difference >= 1000000000L) { // 1 second
+    if (time_difference >= 1000000000L)
+    { // 1 second
         state->first_event_timestamp = current_timestamp;
         state->event_count = 1;
         state->throttle = 0;
-    } else {
+    }
+    else
+    {
         state->event_count++;
     }
 
-    if (state->event_count > max) {
+    if (state->event_count > max)
+    {
         state->event_count = 0;
         state->throttle = 1;
         bpf_map_update_elem(&kubearmor_alert_throttle, &key, state, BPF_ANY);
 
-        // Generating Throttling Alert 
+        // Generating Throttling Alert
         context->event_id = _DROPPING_ALERT;
         set_buffer_offset(DATA_BUF_TYPE, sizeof(sys_context_t));
 
         bufs_t *bufs_p = get_buffer(DATA_BUF_TYPE);
-        if (bufs_p == NULL) {
+        if (bufs_p == NULL)
+        {
             return 0;
         }
 
         save_context_to_buffer(bufs_p, (void *)context);
 
-        if (types != 0) {
+        if (types != 0)
+        {
             save_args_to_buffer(types, args);
         }
 
-        events_perf_submit(ctx);
-        return true; 
+        events_perf_submit(ctx, DATA_BUF_TYPE);
+        return true;
     }
 
     bpf_map_update_elem(&kubearmor_alert_throttle, &key, state, BPF_ANY);
-    return false; 
+#endif
+    return false;
+}
+
+static __always_inline void save_cmd_args_to_buffer(const char __user *const __user *ptr)
+{
+    struct cmd_args_key key;
+    key.tgid = bpf_get_current_pid_tgid();
+
+#pragma unroll
+    for (u8 i = 0; i <= MAX_STR_ARR_ELEM; i++)
+    {
+        key.ind = i;
+        const char *const *curr_ptr = (void *)&ptr[i];
+        const char *argp = NULL;
+        bpf_probe_read(&argp, sizeof(argp), curr_ptr);
+        if (argp)
+        {
+            struct argVal temp;
+            bpf_probe_read_str(&temp.argsArray, sizeof(temp.argsArray), argp);
+            bpf_map_update_elem(&kubearmor_args_store, &key, &temp, BPF_ANY);
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
+// ==== Container Exec Events ====
+
+struct tracepoint_raw_sys_enter
+{
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+
+    int __syscall_nr;
+    int fd;
+    int nstype;
+};
+
+SEC("tracepoint/syscalls/sys_enter_setns")
+int sys_enter_setns(struct tracepoint_raw_sys_enter *ctx)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+
+    struct outer_key data = {};
+    data.pid_ns = get_task_pid_ns_id(t);
+    data.mnt_ns = get_task_mnt_ns_id(t);
+
+    bpf_map_update_elem(&ns_transition, &pid, &data, BPF_ANY);
+
+    return 0;
+}
+
+struct tracepoint_raw_sys_exit
+{
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+    int __syscall_nr;
+    long ret;
+};
+
+SEC("tracepoint/syscalls/sys_exit_setns")
+int sys_exit_setns(struct tracepoint_raw_sys_exit *ctx)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct outer_key *pre_ns_data;
+
+    pre_ns_data = bpf_map_lookup_elem(&ns_transition, &pid);
+    if (!pre_ns_data)
+        return 0;
+
+    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+    u32 new_pid_ns = get_task_pid_ns_id(t);
+    u32 new_mnt_ns = get_task_mnt_ns_id(t);
+
+    if (pre_ns_data->mnt_ns != new_mnt_ns ||
+        pre_ns_data->pid_ns != new_pid_ns)
+    {
+
+        struct outer_key key = {};
+        key.mnt_ns = new_mnt_ns;
+        key.pid_ns = new_pid_ns;
+
+        u32 *matches = bpf_map_lookup_elem(&kubearmor_visibility, &key);
+        u64 exec_id = bpf_ktime_get_ns() | pid;
+        if (matches)
+        {
+            bpf_map_update_elem(&kubearmor_exec_pids, &pid, &exec_id, BPF_ANY);
+        }
+    }
+    bpf_map_delete_elem(&ns_transition, &pid);
+    return 0;
+}
+
+struct tracepoint_sched_process_fork
+{
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+
+    char parent_comm[16];
+    pid_t parent_pid;
+    char child_comm[16];
+    pid_t child_pid;
+};
+
+SEC("tracepoint/sched/sched_process_fork")
+int sched_process_fork(struct tracepoint_sched_process_fork *ctx)
+{
+    u32 parent_pid = bpf_get_current_pid_tgid() >> 32;
+    u32 child_pid = ctx->child_pid;
+
+    u32 *exists = bpf_map_lookup_elem(&kubearmor_exec_pids, &parent_pid);
+    if (exists)
+    {
+        // to make verifier happy on older kernel versions i.e. 4.15
+        u32 val = *exists;
+        bpf_map_update_elem(&kubearmor_exec_pids, &child_pid, &val, BPF_ANY);
+    }
+
+    return 0;
 }
 
 SEC("kprobe/security_path_mknod")
@@ -1200,7 +1463,7 @@ int kprobe__security_bprm_check(struct pt_regs *ctx)
     save_context_to_buffer(bufs_p, (void *)&context);
     save_str_to_buffer(bufs_p, (void *)&string_p->buf[*off]);
 
-    events_perf_submit(ctx);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1232,7 +1495,7 @@ int kprobe__execve(struct pt_regs *ctx)
     }
 
     if (get_kubearmor_config(_ENFORCER_BPFLSM) && drop_syscall(_PROCESS_PROBE))
-    {   
+    {
         return 0;
     }
 
@@ -1246,6 +1509,12 @@ int kprobe__execve(struct pt_regs *ctx)
     char *filename = (char *)READ_KERN(PT_REGS_PARM1(ctx2));
     unsigned long argv = READ_KERN(PT_REGS_PARM2(ctx2));
 #endif
+
+    // save command arguments in buffer if enabled
+    if (get_kubearmor_config(_ENFORCER_BPFLSM) && (get_kubearmor_config(_MATCH_ARGS)))
+    {
+        save_cmd_args_to_buffer((const char *const *)argv);
+    }
 
     init_context(&context);
 
@@ -1264,7 +1533,7 @@ int kprobe__execve(struct pt_regs *ctx)
     save_str_to_buffer(bufs_p, filename);
     save_str_arr_to_buffer(bufs_p, (const char *const *)argv);
 
-    events_perf_submit(ctx);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1287,6 +1556,9 @@ int kretprobe__execve(struct pt_regs *ctx)
     context.event_id = _SYS_EXECVE;
     context.argnum = 0;
     context.retval = PT_REGS_RC(ctx);
+
+    // contains hash data
+    context.hash = 1;
 
     // skip if No such file/directory or if there is an EINPROGRESS
     // EINPROGRESS error, happens when the socket is non-blocking and the connection cannot be completed immediately.
@@ -1315,8 +1587,8 @@ int kretprobe__execve(struct pt_regs *ctx)
         return 0;
 
     save_context_to_buffer(bufs_p, (void *)&context);
-
-    events_perf_submit(ctx);
+    save_all_hashes_to_the_buffer(bufs_p, false);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1370,12 +1642,12 @@ int kprobe__execveat(struct pt_regs *ctx)
 
     save_context_to_buffer(bufs_p, (void *)&context);
 
-    save_to_buffer(bufs_p, (void *)&dirfd, sizeof(int), INT_T);
+    save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&dirfd, sizeof(int), INT_T);
     save_str_to_buffer(bufs_p, (void *)pathname);
     save_str_arr_to_buffer(bufs_p, (const char *const *)argv);
-    save_to_buffer(bufs_p, (void *)&flags, sizeof(int), EXEC_FLAGS_T);
+    save_to_buffer(bufs_p, DATA_BUF_TYPE, (void *)&flags, sizeof(int), EXEC_FLAGS_T);
 
-    events_perf_submit(ctx);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1385,7 +1657,7 @@ int kretprobe__execveat(struct pt_regs *ctx)
 {
     if (skip_syscall())
         return 0;
-    
+
     if (get_kubearmor_config(_ENFORCER_BPFLSM) && drop_syscall(_PROCESS_PROBE))
     {
         return 0;
@@ -1398,6 +1670,7 @@ int kretprobe__execveat(struct pt_regs *ctx)
     context.event_id = _SYS_EXECVEAT;
     context.argnum = 0;
     context.retval = PT_REGS_RC(ctx);
+    context.hash = 1;
 
     // skip if No such file/directory or if there is an EINPROGRESS
     // EINPROGRESS error, happens when the socket is non-blocking and the connection cannot be completed immediately.
@@ -1427,8 +1700,8 @@ int kretprobe__execveat(struct pt_regs *ctx)
         return 0;
 
     save_context_to_buffer(bufs_p, (void *)&context);
-
-    events_perf_submit(ctx);
+    save_all_hashes_to_the_buffer(bufs_p, false);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1443,6 +1716,10 @@ int kprobe__do_exit(struct pt_regs *ctx)
 
     // delete entry for file access which are not successful and are not deleted from file_map since kretprobe/__x64_sys_openat hook is not triggered
     bpf_map_delete_elem(&file_map, &tgid);
+    bpf_map_delete_elem(&proc_file_access, &tgid);
+
+    // delete entry for exec (host) pid
+    bpf_map_delete_elem(&kubearmor_exec_pids, &tgid);
 
     sys_context_t context = {};
 
@@ -1455,6 +1732,7 @@ int kprobe__do_exit(struct pt_regs *ctx)
     context.retval = code;
 
     remove_pid_ns();
+    bpf_map_delete_elem(&kubearmor_ima_hash_map, &context.host_pid);
 
     if (get_kubearmor_config(_ENFORCER_BPFLSM) && drop_syscall(_PROCESS_PROBE))
     {
@@ -1470,7 +1748,7 @@ int kprobe__do_exit(struct pt_regs *ctx)
 
     save_context_to_buffer(bufs_p, (void *)&context);
 
-    events_perf_submit(ctx);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1569,6 +1847,10 @@ static __always_inline int trace_ret_generic(u32 id, struct pt_regs *ctx, u64 ty
     context.argnum = get_arg_num(types);
     context.retval = PT_REGS_RC(ctx);
 
+    if (scope == _FILE_PROBE)
+    {
+        context.hash = 1;
+    }
     // skip if No such file/directory or if there is an EINPROGRESS
     // EINPROGRESS error, happens when the socket is non-blocking and the connection cannot be completed immediately.
     if (context.retval == -2 || context.retval == -115)
@@ -1606,7 +1888,13 @@ static __always_inline int trace_ret_generic(u32 id, struct pt_regs *ctx, u64 ty
 
     save_context_to_buffer(bufs_p, (void *)&context);
     save_args_to_buffer(types, &args);
-    events_perf_submit(ctx);
+    if (scope == _FILE_PROBE)
+    {
+        save_all_hashes_to_the_buffer(bufs_p, true);
+        u32 id = context.host_pid | FILE_HASH_MASK;
+        bpf_map_delete_elem(&kubearmor_ima_hash_map, &id);
+    }
+    events_perf_submit(ctx, DATA_BUF_TYPE);
     return 0;
 }
 
@@ -1679,10 +1967,16 @@ int kprobe__openat(struct pt_regs *ctx)
 
     struct pt_regs *ctx2 = (struct pt_regs *)PT_REGS_PARM1(ctx);
     const char __user *pathname = (void *)READ_KERN(PT_REGS_PARM2(ctx2));
-    char path[8];
-    bpf_probe_read(path, 8, pathname);
+    struct pathname_t path = {};
+    bpf_probe_read_user_str(path.path, sizeof(path.path), pathname);
 
-    if (isProcDir(path) == 0 || isSysDir(path) == 0)
+    if (isProcDir(path.path) == 0)
+    {
+        u64 tgid = bpf_get_current_pid_tgid();
+        bpf_map_update_elem(&proc_file_access, &tgid, &path, BPF_ANY);
+        return 0;
+    }
+    else if (isSysDir(path.path) == 0)
     {
         return 0;
     }
@@ -1921,7 +2215,7 @@ int sys_exit_openat(struct tracepoint_syscalls_sys_exit_t *args)
     save_context_to_buffer(bufs_p, (void *)&context);
     save_args_to_buffer(types, &orig_args);
 
-    events_perf_submit((struct pt_regs *)args);
+    events_perf_submit((struct pt_regs *)args, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -1967,6 +2261,14 @@ int kprobe__accept(struct pt_regs *ctx)
     return save_args(_SYS_ACCEPT, ctx);
 }
 
+// This is disabled currently and will not be loaded by system monitor
+// the decision to disable this probe was taken for two main reasons
+// 1. we're interested in (established) tcp_accpt event only that we're already monitor using __x64_sys_inet_csk_accept
+// 2. if we're interested in socket information as well this is not a good place to get that information
+//    if the request is placed in accept queue then socket might not be initialized and further will change
+//    when the tcp connection is established. A better alternative would be to get the socket information with
+//    kprobe attached to security_socket_accept lsm hook, there we'll get the valid sock address and can read
+//    from there in kretprobe/__x64_sys_accept.
 SEC("kretprobe/__x64_sys_accept")
 int kretprobe__accept(struct pt_regs *ctx)
 {
@@ -2036,48 +2338,94 @@ int kprobe__tcp_connect(struct pt_regs *ctx)
     if (skip_syscall())
         return 0;
 
+    u32 tgid = bpf_get_current_pid_tgid();
+    u64 id = ((u64)_TCP_CONNECT << 32) | tgid;
+
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+
+    args_t args = {};
+    args.args[0] = (unsigned long)sk;
+
+    bpf_map_update_elem(&args_map, &id, &args, BPF_ANY);
+
+    return 0;
+}
+
+SEC("kretprobe/__x64_sys_tcp_connect")
+int kretprobe__tcp_connect(struct pt_regs *ctx)
+{
+    if (skip_syscall())
+        return 0;
+
+    struct sock *sk;
+
+    u32 tgid = bpf_get_current_pid_tgid();
+    u64 id = ((u64)_TCP_CONNECT << 32) | tgid;
+
+    args_t *argp = bpf_map_lookup_elem(&args_map, &id);
+    if (!argp)
+        return 0;
+    bpf_map_delete_elem(&args_map, &id);
+
+    sk = (struct sock *)argp->args[0];
+    if (!sk)
+        return 0;
     if (get_kubearmor_config(_ENFORCER_BPFLSM) && drop_syscall(_NETWORK_PROBE))
     {
         return 0;
     }
-
-    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
     struct sock_common conn = READ_KERN(sk->__sk_common);
     struct sockaddr_in sockv4;
     struct sockaddr_in6 sockv6;
 
-    sys_context_t context = {};
+    // exceeding stack size limit of 512 bytes on specific environments
+    // using perf buffer to optimize it
+    bufs_t *bufs_p = get_buffer(DATA_BUF_TYPE);
+    if (bufs_p == NULL)
+        return 0;
+
+    sys_context_t *context = (sys_context_t *)bufs_p->buf;
+    if (context == NULL)
+        return 0;
+
+    __builtin_memset(context, 0, sizeof(sys_context_t));
+
     args_t args = {};
     u64 types = ARG_TYPE0(STR_T) | ARG_TYPE1(SOCKADDR_T);
 
-    init_context(&context);
-    context.argnum = get_arg_num(types);
-    context.retval = PT_REGS_RC(ctx);
+    init_context(context);
+    context->argnum = get_arg_num(types);
+    context->retval = PT_REGS_RC(ctx);
 
-    if (context.retval >= 0 && drop_syscall(_NETWORK_PROBE))
+    if (context->retval >= 0 && drop_syscall(_NETWORK_PROBE))
     {
         return 0;
     }
 
-    if (get_connection_info(&conn, &sockv4, &sockv6, &context, &args, _TCP_CONNECT) != 0)
+    if (get_connection_info(&conn, &sockv4, &sockv6, context, &args, _TCP_CONNECT) != 0)
     {
         return 0;
     }
 
-    args.args[0] = (unsigned long)conn.skc_prot->name;
+    const char *proto_str_p = READ_KERN(conn.skc_prot->name);
 
-    if (context.retval < 0 && !get_kubearmor_config(_ENFORCER_BPFLSM) && get_kubearmor_config(_ALERT_THROTTLING) && should_drop_alerts_per_container(&context, ctx, types, &args))
+    // so far this is the only hack that worked, using a temporary stack variable
+    // skc_prot->name is of size 32
+    // but it's unclear why extending to 32 leading to issues
+    // we're not expecting protocol string (TCP/TCPv6) to exceed 16 bytes size
+    // it's should be safe to use 16 here
+    char proto_str[16] = {};
+    bpf_probe_read_str(proto_str, sizeof(proto_str), proto_str_p);
+
+    args.args[0] = (unsigned long)proto_str;
+    if (context->retval < 0 && !get_kubearmor_config(_ENFORCER_BPFLSM) && get_kubearmor_config(_ALERT_THROTTLING) && should_drop_alerts_per_container(context, ctx, types, &args))
     {
         return 0;
     }
 
     set_buffer_offset(DATA_BUF_TYPE, sizeof(sys_context_t));
-    bufs_t *bufs_p = get_buffer(DATA_BUF_TYPE);
-    if (bufs_p == NULL)
-        return 0;
-    save_context_to_buffer(bufs_p, (void *)&context);
     save_args_to_buffer(types, &args);
-    events_perf_submit(ctx);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
 
     return 0;
 }
@@ -2099,17 +2447,16 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
 
     // Code from https://github.com/iovisor/bcc/blob/master/tools/tcpaccept.py with adaptations
     u16 protocol = 1;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+    protocol = READ_KERN(newsk->sk_protocol);
+#else
     int gso_max_segs_offset = offsetof(struct sock, sk_gso_max_segs);
     int sk_lingertime_offset = offsetof(struct sock, sk_lingertime);
-
     if (sk_lingertime_offset - gso_max_segs_offset == 2)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-        protocol = READ_KERN(newsk->sk_protocol);
-#else
         protocol = newsk->sk_protocol;
-#endif
     else if (sk_lingertime_offset - gso_max_segs_offset == 4)
-    // 4.10+ with little endian
+// 4.10+ with little endian
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         protocol = READ_KERN(*(u8 *)((u64)&newsk->sk_gso_max_segs - 3));
     else
@@ -2124,6 +2471,7 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
 #else
 #error "Fix your compiler's __BYTE_ORDER__?!"
 #endif
+#endif
 
     if (protocol != IPPROTO_TCP)
         return 0;
@@ -2131,39 +2479,210 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
     struct sock_common conn = READ_KERN(newsk->__sk_common);
     struct sockaddr_in sockv4;
     struct sockaddr_in6 sockv6;
-    sys_context_t context = {};
+
+    // exceeding stack size limit of 512 bytes on specific environments
+    // using perf buffer to optimize it
+    bufs_t *bufs_p = get_buffer(DATA_BUF_TYPE);
+    if (bufs_p == NULL)
+        return 0;
+
+    sys_context_t *context = (sys_context_t *)bufs_p->buf;
+    if (context == NULL)
+        return 0;
+
+    __builtin_memset(context, 0, sizeof(sys_context_t));
+
     args_t args = {};
     u64 types = ARG_TYPE0(STR_T) | ARG_TYPE1(SOCKADDR_T);
+    init_context(context);
+    context->argnum = get_arg_num(types);
+    int *err_ptr = (int *)PT_REGS_PARM3(ctx);
+    bpf_probe_read(&context->retval, sizeof(context->retval), err_ptr);
+
+    if (context->retval >= 0 && drop_syscall(_NETWORK_PROBE))
+    {
+        return 0;
+    }
+
+    if (get_connection_info(&conn, &sockv4, &sockv6, context, &args, _TCP_ACCEPT) != 0)
+    {
+        return 0;
+    }
+
+    const char *proto_str_p = READ_KERN(conn.skc_prot->name);
+    // so far this is the only hack that worked, using a temporary stack variable
+    // skc_prot->name is of size 32
+    // but it's unclear why extending to 32 leading to issues
+    // we're not expecting protocol string (TCP/TCPv6) to exceed 16 bytes size
+    // it's should be safe to use 16 here
+    char proto_str[16] = {};
+    bpf_probe_read_str(proto_str, sizeof(proto_str), proto_str_p);
+
+    args.args[0] = (unsigned long)proto_str;
+
+    if (context->retval < 0 && !get_kubearmor_config(_ENFORCER_BPFLSM) && get_kubearmor_config(_ALERT_THROTTLING) && should_drop_alerts_per_container(context, ctx, types, &args))
+    {
+        return 0;
+    }
+
+    set_buffer_offset(DATA_BUF_TYPE, sizeof(sys_context_t));
+    save_args_to_buffer(types, &args);
+    events_perf_submit(ctx, DATA_BUF_TYPE);
+
+    return 0;
+}
+
+#define UDPHDR_LEN 8
+
+SEC("kprobe/udp_send_skb")
+int kprobe__udp_send_skb(struct pt_regs *ctx)
+{
+
+    if (skip_syscall())
+        return 0;
+
+    if (get_kubearmor_config(_ENFORCER_BPFLSM) && drop_syscall(_DNS_PROBE))
+        return 0;
+
+    struct sk_buff *skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
+    struct flowi4 *fl4 = (struct flowi4 *)PT_REGS_PARM2(ctx);
+    if (skb == NULL || fl4 == NULL)
+        return 0;
+
+    struct sock *sk = NULL;
+    bpf_probe_read(&sk, sizeof(sk), &skb->sk);
+    if (sk == NULL)
+        return 0;
+
+    __u16 dport = 0;
+    bpf_probe_read(&dport, sizeof(dport), &fl4->uli.ports.dport);
+    dport = ntohs(dport);
+    if (dport != 53)
+        return 0;
+
+    __u32 skb_len = 0;
+    bpf_probe_read(&skb_len, sizeof(skb_len), &skb->len);
+    if (skb_len > 512 + UDPHDR_LEN) // MAX_DNS_SIZE + udp header
+        return 0;
+
+    unsigned char *head = NULL;
+    __u16 trans_off = 0;
+    bpf_probe_read(&head, sizeof(head), &skb->head);
+    bpf_probe_read(&trans_off, sizeof(trans_off), &skb->transport_header);
+    void *data = head + trans_off + UDPHDR_LEN;
+
+    sys_context_t context = {};
+    args_t args = {};
+    u64 types = 0;
     init_context(&context);
-    context.argnum = get_arg_num(types);
-    context.retval = PT_REGS_PARM3(ctx);
+    context.argnum = 3;
+    context.retval = 0;
+    context.event_id = _UDP_SEND_SKB;
 
-    if (context.retval >= 0 && drop_syscall(_NETWORK_PROBE))
+    if (context.retval >= 0 && drop_syscall(_DNS_PROBE))
+        return 0;
+
+    if (context.retval < 0 && !get_kubearmor_config(_ENFORCER_BPFLSM) &&
+        get_kubearmor_config(_ALERT_THROTTLING) &&
+        should_drop_alerts_per_container(&context, ctx, types, &args))
+        return 0;
+
+    set_buffer_offset(DNS_BUF_TYPE, sizeof(sys_context_t));
+    bufs_t *bufs_p = get_buffer(DNS_BUF_TYPE);
+    if (bufs_p == NULL)
+        return 0;
+    save_context_to_buffer(bufs_p, (void *)&context);
+
+    struct sock_common conn = READ_KERN(sk->__sk_common);
+    struct sockaddr_in sockv4 = {};
+    sockv4.sin_family = conn.skc_family;
+    bpf_probe_read(&sockv4.sin_addr.s_addr, sizeof(sockv4.sin_addr.s_addr), &fl4->daddr);
+    sockv4.sin_port = dport;
+
+    save_to_buffer(bufs_p, DNS_BUF_TYPE, (void *)&sockv4, sizeof(struct sockaddr_in), SOCKADDR_T);
+    save_dns_data_to_dns_buffer(bufs_p, data, UDP_MSG);
+    events_perf_submit(ctx, DNS_BUF_TYPE);
+    return 0;
+}
+
+// This probe is currently not attached by the system monitor.
+// The decision to disable attaching this probe was taken for performance reasons.
+
+SEC("kprobe/udp_sendmsg")
+int kprobe__udp_sendmsg(struct pt_regs *ctx)
+{
+    if (skip_syscall())
+        return 0;
+
+    if (get_kubearmor_config(_ENFORCER_BPFLSM) && drop_syscall(_DNS_PROBE))
     {
         return 0;
     }
 
-    if (get_connection_info(&conn, &sockv4, &sockv6, &context, &args, _TCP_ACCEPT) != 0)
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    if (sk == NULL)
+        return 0;
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    size_t len = (size_t)PT_REGS_PARM3(ctx);
+
+    struct iovec iov;
+    void *data = NULL;
+    __u16 dport = 0;
+
+    bpf_probe_read(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+    dport = ntohs(dport);
+    if (dport != 53)
+        return 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 13) || RHEL9_BUILD_GTE_400
+    bpf_probe_read(&iov, sizeof(iov), &msg->msg_iter.__iov);
+#else
+    bpf_probe_read(&iov, sizeof(iov), &msg->msg_iter.iov);
+#endif
+    bpf_probe_read(&data, sizeof(data), &iov.iov_base);
+
+    if (len > 512) // MAX_DNS_SIZE
+        return 0;
+
+    sys_context_t context = {};
+    args_t args = {};
+    u64 types = 0;
+    init_context(&context);
+    context.argnum = 3;
+    // Presuming the success event
+    context.retval = 0;
+    context.event_id = _UDP_SENDMSG;
+
+    if (context.retval >= 0 && drop_syscall(_DNS_PROBE))
     {
         return 0;
     }
-
-    args.args[0] = (unsigned long)conn.skc_prot->name;
 
     if (context.retval < 0 && !get_kubearmor_config(_ENFORCER_BPFLSM) && get_kubearmor_config(_ALERT_THROTTLING) && should_drop_alerts_per_container(&context, ctx, types, &args))
     {
         return 0;
     }
 
-    set_buffer_offset(DATA_BUF_TYPE, sizeof(sys_context_t));
-    bufs_t *bufs_p = get_buffer(DATA_BUF_TYPE);
+    set_buffer_offset(DNS_BUF_TYPE, sizeof(sys_context_t));
+    bufs_t *bufs_p = get_buffer(DNS_BUF_TYPE);
     if (bufs_p == NULL)
         return 0;
-
     save_context_to_buffer(bufs_p, (void *)&context);
-    save_args_to_buffer(types, &args);
-    events_perf_submit(ctx);
 
+    // get socket info
+    struct sock_common conn = READ_KERN(sk->__sk_common);
+    // udp_sendmsg operates on AF_INET socket
+    struct sockaddr_in sockv4;
+    sockv4.sin_family = conn.skc_family;
+    sockv4.sin_addr.s_addr = conn.skc_daddr;
+    sockv4.sin_port = dport;
+
+    // save socket, domain-name(QNAME) and query-type (QTYPE) as args
+    save_to_buffer(bufs_p, DNS_BUF_TYPE, (void *)&sockv4, sizeof(struct sockaddr_in), SOCKADDR_T);
+    // save_to_dns_buffer(bufs_p, (void *)&sockv4, sizeof(struct sockaddr_in), SOCKADDR_T);
+    save_dns_data_to_dns_buffer(bufs_p, data, UDP_MSG);
+    // dns_events_perf_submit(ctx, DATA_BUF_TYPE);
+    events_perf_submit(ctx, DNS_BUF_TYPE);
     return 0;
 }
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

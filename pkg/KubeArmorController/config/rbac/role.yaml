@@ -1,9 +1,7 @@
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   name: manager-role
 rules:
 - apiGroups:
@@ -21,45 +19,8 @@ rules:
   - security.kubearmor.com
   resources:
   - kubearmorclusterpolicies
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - security.kubearmor.com
-  resources:
-  - kubearmorclusterpolicies/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - security.kubearmor.com
-  resources:
   - kubearmorhostpolicies
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - security.kubearmor.com
-  resources:
-  - kubearmorhostpolicies/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - security.kubearmor.com
-  resources:
+  - kubearmornetworkpolicies
   - kubearmorpolicies
   verbs:
   - create
@@ -72,6 +33,9 @@ rules:
 - apiGroups:
   - security.kubearmor.com
   resources:
+  - kubearmorclusterpolicies/status
+  - kubearmorhostpolicies/status
+  - kubearmornetworkpolicies/status
   - kubearmorpolicies/status
   verbs:
   - get

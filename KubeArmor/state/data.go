@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2023 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package state
 
@@ -25,7 +25,7 @@ func (sa *StateAgent) PushContainerEvent(container tp.Container, event string) {
 	sa.KubeArmorNamespacesLock.Lock()
 	if event == EventAdded {
 		// create this kubearmor ns if it doesn't exist
-		// currently only "container_namespace" until we have config agent
+		// uses hostname until we have config agent
 		if ns, ok := sa.KubeArmorNamespaces[namespace]; !ok {
 			nsObj := types.Namespace{
 				Name: namespace,
@@ -88,8 +88,6 @@ func (sa *StateAgent) PushContainerEvent(container tp.Container, event string) {
 			return
 		}
 	}
-
-	return
 }
 
 // PushNodeEvent function pushes node event
@@ -125,8 +123,6 @@ func (sa *StateAgent) PushNodeEvent(node tp.Node, event string) {
 			return
 		}
 	}
-
-	return
 }
 
 // PushNamespaceEvent function pushes namespace event

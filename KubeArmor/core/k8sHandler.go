@@ -1,31 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package core
 
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"os"
-	"path/filepath"
 	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	rest "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	ctrl "sigs.k8s.io/controller-runtime"
 
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 	kspclient "github.com/kubearmor/KubeArmor/pkg/KubeArmorController/client/clientset/versioned"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // ================= //
@@ -47,41 +41,13 @@ type K8sHandler struct {
 	HTTPClient  *http.Client
 	WatchClient *http.Client
 
-	K8sToken string
-	K8sHost  string
-	K8sPort  string
+	K8sHost string
 }
 
 // NewK8sHandler Function
 func NewK8sHandler() *K8sHandler {
 	kh := &K8sHandler{}
 
-	if val, ok := os.LookupEnv("KUBERNETES_SERVICE_HOST"); ok {
-		kh.K8sHost = val
-	} else {
-		kh.K8sHost = "127.0.0.1"
-	}
-
-	if val, ok := os.LookupEnv("KUBERNETES_PORT_443_TCP_PORT"); ok {
-		kh.K8sPort = val
-	} else {
-		kh.K8sPort = "8001" // kube-proxy
-	}
-
-	kh.HTTPClient = &http.Client{
-		Timeout: time.Second * 5,
-		// #nosec
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	kh.WatchClient = &http.Client{
-		// #nosec
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
 	config, err := ctrl.GetConfig()
 	if err != nil {
 		kg.Warnf("Error creating kubernetes config, %s", err)
@@ -102,75 +68,36 @@ func NewK8sHandler() *K8sHandler {
 // ================ //
 
 // InitK8sClient Function
-func (kh *K8sHandler) InitK8sClient() bool {
+func (kh *K8sHandler) InitK8sClient() error {
 	if !kl.IsK8sEnv() { // not Kubernetes
-		return false
+		return fmt.Errorf("not running in kubernetes environment")
 	}
 
 	if kh.K8sClient == nil {
-		if kl.IsInK8sCluster() {
-			return kh.InitInclusterAPIClient()
+		config := ctrl.GetConfigOrDie()
+		kh.K8sHost = config.Host
+
+		var err error
+		kh.K8sClient, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			return fmt.Errorf("failed to create kubernetes client: %w", err)
 		}
-		if kl.IsK8sLocal() {
-			return kh.InitLocalAPIClient()
+
+		kh.WatchClient, err = rest.HTTPClientFor(config)
+		if err != nil {
+			return fmt.Errorf("failed to create watch client: %w", err)
 		}
-		return false
-	}
 
-	return true
-}
+		configWithTimeout := rest.CopyConfig(config)
+		configWithTimeout.Timeout = time.Second * 5
 
-// InitLocalAPIClient Function
-func (kh *K8sHandler) InitLocalAPIClient() bool {
-	kubeconfig := os.Getenv("KUBECONFIG")
-	if kubeconfig == "" {
-		kubeconfig = os.Getenv("HOME") + "/.kube/config"
-		if _, err := os.Stat(filepath.Clean(kubeconfig)); err != nil {
-			return false
+		kh.HTTPClient, err = rest.HTTPClientFor(configWithTimeout)
+		if err != nil {
+			return fmt.Errorf("failed to create http client: %w", err)
 		}
 	}
 
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		return false
-	}
-
-	// creates the clientset
-	client, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return false
-	}
-	kh.K8sClient = client
-
-	return true
-}
-
-// InitInclusterAPIClient Function
-func (kh *K8sHandler) InitInclusterAPIClient() bool {
-	read, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	if err != nil {
-		return false
-	}
-	kh.K8sToken = string(read)
-
-	// create the configuration by token
-	kubeConfig := &rest.Config{
-		Host:        "https://" + kh.K8sHost + ":" + kh.K8sPort,
-		BearerToken: kh.K8sToken,
-		// #nosec
-		TLSClientConfig: rest.TLSClientConfig{
-			Insecure: true,
-		},
-	}
-
-	client, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		return false
-	}
-	kh.K8sClient = client
-
-	return true
+	return nil
 }
 
 // ============== //
@@ -178,31 +105,22 @@ func (kh *K8sHandler) InitInclusterAPIClient() bool {
 // ============== //
 
 // DoRequest Function
-func (kh *K8sHandler) DoRequest(cmd string, data interface{}, path string) ([]byte, error) {
-	URL := ""
-
-	if kl.IsInK8sCluster() {
-		URL = "https://" + kh.K8sHost + ":" + kh.K8sPort
-	} else {
-		URL = "http://" + kh.K8sHost + ":" + kh.K8sPort
-	}
+func (kh *K8sHandler) DoRequest(cmd string, data any, path string) ([]byte, error) {
+	URL := kh.K8sHost + path
 
 	pbytes, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest(cmd, URL+path, bytes.NewBuffer(pbytes))
+	req, err := http.NewRequest(cmd, URL, bytes.NewBuffer(pbytes))
 	if err != nil {
 		return nil, err
 	}
 
-	if kl.IsInK8sCluster() {
-		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", kh.K8sToken))
-	}
+	req.Header.Add("Content-Type", "application/json")
 
-	resp, err := kh.HTTPClient.Do(req)
+	resp, err := kh.HTTPClient.Do(req) // #nosec G704 -- safe request sent only to trusted Kubernetes API server
 	if err != nil {
 		return nil, err
 	}
@@ -256,14 +174,14 @@ func (kh *K8sHandler) PatchResourceWithAppArmorAnnotations(namespaceName, deploy
 		spec = spec + `}}}}}`
 	}
 
-	if kind == "StatefulSet" {
+	switch kind {
+	case "StatefulSet":
 		_, err := kh.K8sClient.AppsV1().StatefulSets(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, []byte(spec), metav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
 		return nil
-
-	} else if kind == "ReplicaSet" {
+	case "ReplicaSet":
 		rs, err := kh.K8sClient.AppsV1().ReplicaSets(namespaceName).Get(context.Background(), deploymentName, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -275,38 +193,37 @@ func (kh *K8sHandler) PatchResourceWithAppArmorAnnotations(namespaceName, deploy
 		}
 
 		// To update the annotations we need to restart the replicaset,we scale it down and scale it back up
-		patchData := []byte(fmt.Sprintf(`{"spec": {"replicas": 0}}`))
+		patchData := fmt.Appendf(nil, `{"spec": {"replicas": 0}}`)
 		_, err = kh.K8sClient.AppsV1().ReplicaSets(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, patchData, metav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
 		time.Sleep(2 * time.Second)
-		patchData2 := []byte(fmt.Sprintf(`{"spec": {"replicas": %d}}`, replicas))
+		patchData2 := fmt.Appendf(nil, `{"spec": {"replicas": %d}}`, replicas)
 		_, err = kh.K8sClient.AppsV1().ReplicaSets(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, patchData2, metav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
 
 		return nil
-	} else if kind == "DaemonSet" {
+	case "DaemonSet":
 		_, err := kh.K8sClient.AppsV1().DaemonSets(namespaceName).Patch(context.Background(), deploymentName, types.MergePatchType, []byte(spec), metav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
 		return nil
-
-	} else if kind == "Deployment" {
+	case "Deployment":
 		_, err := kh.K8sClient.AppsV1().Deployments(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, []byte(spec), metav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
-	} else if kind == "CronJob" {
+	case "CronJob":
 		_, err := kh.K8sClient.BatchV1().CronJobs(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, []byte(spec), metav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
-	} else if kind == "Pod" {
-		// this condition wont be triggered, handled by controller
+	case "Pod":
+		// this condition won't be triggered, handled by controller
 		return nil
 
 	}
@@ -429,59 +346,14 @@ func (kh *K8sHandler) GetStatefulSet(namespaceName, podownerName string) (string
 	return ss.ObjectMeta.Name, ss.ObjectMeta.Namespace
 }
 
-// ========== //
-// == Pods == //
-// ========== //
-
-// WatchK8sPods Function
-func (kh *K8sHandler) WatchK8sPods(nodeName string) *http.Response {
-	if !kl.IsK8sEnv() { // not Kubernetes
-		return nil
-	}
-
-	queryParams := url.Values{}
-	if nodeName != "" {
-		queryParams.Add("fieldSelector", "spec.nodeName="+nodeName)
-	}
-	queryParams.Add("watch", "true")
-
-	if kl.IsInK8sCluster() { // kube-apiserver
-		URL := "https://" + kh.K8sHost + ":" + kh.K8sPort + "/api/v1/pods?" + queryParams.Encode()
-
-		req, err := http.NewRequest("GET", URL, nil)
-		if err != nil {
-			return nil
-		}
-
-		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", kh.K8sToken))
-
-		resp, err := kh.WatchClient.Do(req)
-		if err != nil {
-			return nil
-		}
-
-		return resp
-	}
-
-	// kube-proxy (local)
-	URL := "http://" + kh.K8sHost + ":" + kh.K8sPort + "/api/v1/pods?" + queryParams.Encode()
-
-	if resp, err := http.Get(URL); err == nil /* #nosec */ {
-		return resp
-	}
-
-	return nil
-}
-
 // ====================== //
 // == Custom Resources == //
 // ====================== //
 
 // CheckCustomResourceDefinition Function
-func (kh *K8sHandler) CheckCustomResourceDefinition(resourceName string) bool {
+func (kh *K8sHandler) CheckCustomResourceDefinition(resourceName string) error {
 	if !kl.IsK8sEnv() { // not Kubernetes
-		return false
+		return fmt.Errorf("not running in Kubernetes environment")
 	}
 
 	exist := false
@@ -508,84 +380,14 @@ func (kh *K8sHandler) CheckCustomResourceDefinition(resourceName string) bool {
 			if errIn := json.Unmarshal(resBody, &res); errIn == nil {
 				for _, resource := range res.APIResources {
 					if resource.Name == resourceName {
-						return true
+						return nil
 					}
 				}
 			}
 		}
 	}
 
-	return false
-}
-
-// WatchK8sSecurityPolicies Function
-func (kh *K8sHandler) WatchK8sSecurityPolicies() *http.Response {
-	if !kl.IsK8sEnv() { // not Kubernetes
-		return nil
-	}
-
-	if kl.IsInK8sCluster() {
-		URL := "https://" + kh.K8sHost + ":" + kh.K8sPort + "/apis/security.kubearmor.com/v1/kubearmorpolicies?watch=true"
-
-		req, err := http.NewRequest("GET", URL, nil)
-		if err != nil {
-			return nil
-		}
-
-		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", kh.K8sToken))
-
-		resp, err := kh.WatchClient.Do(req)
-		if err != nil {
-			return nil
-		}
-
-		return resp
-	}
-
-	// kube-proxy (local)
-	URL := "http://" + kh.K8sHost + ":" + kh.K8sPort + "/apis/security.kubearmor.com/v1/kubearmorpolicies?watch=true"
-
-	if resp, err := http.Get(URL); err == nil /* #nosec */ {
-		return resp
-	}
-
-	return nil
-}
-
-// WatchK8sHostSecurityPolicies Function
-func (kh *K8sHandler) WatchK8sHostSecurityPolicies() *http.Response {
-	if !kl.IsK8sEnv() { // not Kubernetes
-		return nil
-	}
-
-	if kl.IsInK8sCluster() {
-		URL := "https://" + kh.K8sHost + ":" + kh.K8sPort + "/apis/security.kubearmor.com/v1/kubearmorhostpolicies?watch=true"
-
-		req, err := http.NewRequest("GET", URL, nil)
-		if err != nil {
-			return nil
-		}
-
-		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", kh.K8sToken))
-
-		resp, err := kh.WatchClient.Do(req)
-		if err != nil {
-			return nil
-		}
-
-		return resp
-	}
-
-	// kube-proxy (local)
-	URL := "http://" + kh.K8sHost + ":" + kh.K8sPort + "/apis/security.kubearmor.com/v1/kubearmorhostpolicies?watch=true"
-
-	if resp, err := http.Get(URL); err == nil /* #nosec */ {
-		return resp
-	}
-
-	return nil
+	return fmt.Errorf("custom resource definition '%s' not found", resourceName)
 }
 
 // this function get the owner details of a pod

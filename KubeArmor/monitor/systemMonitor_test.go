@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package monitor
 
@@ -51,7 +51,7 @@ func TestSystemMonitor(t *testing.T) {
 	}
 	t.Log("[PASS] Created logger")
 
-	// montor lock
+	// monitor lock
 	monitorLock := new(sync.RWMutex)
 
 	// Create System Monitor
@@ -118,7 +118,7 @@ func TestTraceSyscallWithPod(t *testing.T) {
 	}
 	t.Log("[PASS] Created logger")
 
-	// montor lock
+	// monitor lock
 	monitorLock := new(sync.RWMutex)
 
 	// Create System Monitor

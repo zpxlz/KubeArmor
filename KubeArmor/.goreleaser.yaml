@@ -7,27 +7,33 @@ builds:
       - linux
     goarch:
       - amd64
-      - arm64
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - "-X main.BuildDate={{.Date}}"
+      - "-X main.GitCommit={{.Commit}}"
+      - "-X main.GitBranch={{.Branch}}"
+      - "-X main.GitSummary={{.Summary}}"
 
 release:
   replace_existing_artifacts: true
   mode: replace
   make_latest: false
 
+# to handle checksum name conflict
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Env.ARCH }}_checksums.txt"
+
 signs:
   - cmd: cosign
-    certificate: '${artifact}.cert'
+    signature: "${artifact}.sigstore.json"
     args:
       - sign-blob
-      - '--output-certificate=${certificate}' 
-      - '--output-signature=${signature}'
+      - "--bundle=${signature}"
       - '${artifact}'
       - --yes
     artifacts: all
     output: true
-
 archives:
   - id: "kubearmor"
     builds:
@@ -44,8 +50,6 @@ archives:
       - src: ./packaging/kubearmor.service
         dst: /usr/lib/systemd/system/
         strip_parent: true
-      - src: ./karmor
-        dst: /usr/local/bin/karmor
 
 nfpms:
   - id: "kubearmor"
@@ -56,7 +60,7 @@ nfpms:
       - rpm
     replaces:
       - kubearmor
-    maintainer: "Barun Acharya <barun.acharya@accuknox.com>"
+    maintainer: "KubeArmor Team <support@kubearmor.io>"
     description: |
       Cloud-native Runtime Security Enforcement System
     vendor: "kubearmor"
@@ -80,8 +84,6 @@ nfpms:
       - src: /opt/kubearmor/kubearmor
         dst: /usr/local/bin/kubearmor
         type: symlink
-      - src: ./karmor
-        dst: /usr/local/bin/karmor
     scripts:
       postinstall: packaging/post-install.sh
     overrides:

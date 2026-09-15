@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 # make a temp build directory
 sudo rm -rf /tmp/build
@@ -88,7 +88,7 @@ fi
 
 # install kustomize
 cd /tmp/build/
-curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"  | bash
+curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" -o /tmp/install_kustomize.sh && bash /tmp/install_kustomize.sh
 sudo mv kustomize /usr/local/bin
 
 # remove downloaded files

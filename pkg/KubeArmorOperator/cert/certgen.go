@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package cert is responsible for generating client and server certificates using KubeArmor cert pkg.
 package cert
@@ -116,7 +116,7 @@ func GetCertWithCaSecret(ca, crt, key *[]byte, name, namespace string, labels *m
 }
 
 func GetAllTlsCertSecrets() ([]*corev1.Secret, error) {
-	fmt.Println("Prepairing all the tls secrets")
+	fmt.Println("Preparing all the tls secrets")
 	secrets := []*corev1.Secret{}
 	var certGenErr, err error
 	var kaCaCert, kaClientCert, kaRelayCert certutil.CertBytes

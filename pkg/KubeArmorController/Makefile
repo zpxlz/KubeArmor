@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 CURDIR := $(shell pwd)
 
@@ -7,8 +7,10 @@ CURDIR := $(shell pwd)
 IMG ?= kubearmor/kubearmor-controller
 # Image Tag to use all building/pushing image targets
 TAG ?= v0.1
+# Build variable to use all building/pushing image targets
+BUILD_MODE ?= --push
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
-CRD_OPTIONS ?= "crd:trivialVersions=true,preserveUnknownFields=false"
+CRD_OPTIONS ?= "crd"
 # Target platforms for build
 PLATFORM ?= "linux/amd64,linux/arm64/v8"
 
@@ -49,7 +51,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	go mod tidy; $(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	go mod tidy; $(CONTROLLER_GEN) crd rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 	cp config/crd/bases/security.kubearmor.com_kubearmorpolicies.yaml ../../deployments/CRD/KubeArmorPolicy.yaml
 	cp config/crd/bases/security.kubearmor.com_kubearmorpolicies.yaml crd/KubeArmorPolicy.yaml
 	cp config/crd/bases/security.kubearmor.com_kubearmorpolicies.yaml ../../deployments/helm/KubeArmor/templates/crds/ksp.yaml
@@ -59,6 +61,9 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 	cp config/crd/bases/security.kubearmor.com_kubearmorhostpolicies.yaml ../../deployments/CRD/KubeArmorHostPolicy.yaml
 	cp config/crd/bases/security.kubearmor.com_kubearmorhostpolicies.yaml crd/KubeArmorHostPolicy.yaml
 	cp config/crd/bases/security.kubearmor.com_kubearmorhostpolicies.yaml ../../deployments/helm/KubeArmor/templates/crds/hsp.yaml
+	cp config/crd/bases/security.kubearmor.com_kubearmornetworkpolicies.yaml ../../deployments/CRD/KubeArmorNetworkPolicy.yaml
+	cp config/crd/bases/security.kubearmor.com_kubearmornetworkpolicies.yaml crd/KubeArmorNetworkPolicy.yaml
+	cp config/crd/bases/security.kubearmor.com_kubearmornetworkpolicies.yaml ../../deployments/helm/KubeArmor/templates/crds/nsp.yaml
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -83,23 +88,35 @@ test: manifests generate fmt vet ## Run tests.
 
 .PHONY: build
 build: generate fmt vet ## Build manager binary.
-	go build -o bin/manager main.go
+	go build -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./main.go
+	go run ./cmd/main.go
 
 .PHONY: docker-build
 docker-build: build ## Build docker image with the manager.
-	docker build -t ${IMG}:${TAG} -t ${IMG}:latest --build-arg VERSION=${TAG} .
+	docker build -t ${IMG}:${TAG} -t ${IMG}:latest --target controller --build-arg VERSION=${TAG} .
 
 docker-buildx: build ## Build docker image with the manager multiple archs.
-	docker buildx build --platform ${PLATFORM} --build-arg VERSION=${TAG} --push -t ${IMG}:${TAG} .
+	docker buildx build --metadata-file kubearmor-controller.json --target controller --platform ${PLATFORM} --build-arg VERSION=${TAG} ${BUILD_MODE} -t ${IMG}:${TAG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	docker push ${IMG}:${TAG}
 	docker push ${IMG}:latest
+
+.PHONY: docker-build-ubi
+docker-build-ubi: build ## Build docker image with the manager.
+	docker build -t ${IMG}-ubi:${TAG} --target controller-ubi -t ${IMG}-ubi:latest --build-arg VERSION=${TAG} .
+
+docker-buildx-ubi: build ## Build docker image with the manager multiple archs.
+	docker buildx build --metadata-file kubearmor-controller-ubi.json --platform ${PLATFORM} --target controller-ubi --build-arg VERSION=${TAG} ${BUILD_MODE} -t ${IMG}-ubi:${TAG} .
+
+.PHONY: docker-push-ubi
+docker-push-ubi: ## Push docker image with the manager.
+	docker push ${IMG}-ubi:${TAG}
+	docker push ${IMG}-ubi:latest
 
 client/gen:
 	@echo "--> Running code-generator to generate clients"
@@ -178,7 +195,7 @@ uninstall-crd: manifests kustomize ## Uninstall CRDs from the K8s cluster specif
 CONTROLLER_GEN = $(GOBIN)/controller-gen
 .PHONY: controller-gen
 controller-gen: ## Download controller-gen locally if necessary.
-	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.14.0)
+	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0)
 
 KUSTOMIZE = /usr/local/bin/kustomize
 .PHONY: kustomize

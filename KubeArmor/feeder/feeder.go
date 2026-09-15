@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package feeder is responsible for sanitizing and relaying telemetry and alerts data to connected clients
 package feeder
@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,31 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 )
+
+// parseDataString parses a space-separated key=value string into a map
+func parseDataString(data string) map[string]string {
+	if data == "" {
+		return nil
+	}
+
+	result := make(map[string]string)
+	pairs := strings.Fields(data) // Split by whitespace
+
+	for _, pair := range pairs {
+		if strings.Contains(pair, "=") {
+			parts := strings.SplitN(pair, "=", 2) // Split only on first "="
+			if len(parts) == 2 {
+				key := parts[0]
+				if len(key) > 0 {
+					key = strings.ToUpper(key[:1]) + key[1:]
+				}
+				result[key] = parts[1]
+			}
+		}
+	}
+
+	return result
+}
 
 // ============ //
 // == Global == //
@@ -63,6 +90,16 @@ type EventStructs struct {
 
 	LogStructs map[string]EventStruct[pb.Log]
 	LogLock    sync.RWMutex
+}
+type cachedUserName struct {
+	Username  string
+	ExpiresAt time.Time
+}
+
+type UserNameMap struct {
+	usernames map[uint32]cachedUserName
+	mu        sync.RWMutex
+	ttl       time.Duration
 }
 
 // AddMsgStruct Function
@@ -173,13 +210,17 @@ type BaseFeeder struct {
 	LogFile *os.File
 
 	// Activated Enforcer
-	Enforcer string
+	Enforcer     string
+	EnforcerLock *sync.RWMutex
 
 	// Msg, log and alert connection stores
 	EventStructs *EventStructs
 
 	// True if feeder and its workers are working
 	Running bool
+
+	// Number of dropped logs
+	DroppedLogs uint64
 
 	// LogServer //
 
@@ -191,6 +232,9 @@ type BaseFeeder struct {
 
 	// log server
 	LogServer *grpc.Server
+
+	// username map
+	UserNameMap UserNameMap
 }
 
 type OuterKey struct {
@@ -218,15 +262,23 @@ type Feeder struct {
 	DefaultPostures     map[string]tp.DefaultPosture
 	DefaultPosturesLock *sync.Mutex
 
-	AlertMap map[OuterKey]AlertThrottleState
+	AlertMap     map[OuterKey]AlertThrottleState
+	AlertMapLock sync.RWMutex
 
 	ContainerNsKey map[string]common.OuterKey
 }
 
 // NewFeeder Function
-func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
+func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) (feeder *Feeder) {
 	fd := &Feeder{}
 
+	defer func() {
+		if feeder == nil {
+			if err := fd.DestroyFeeder(); err != nil {
+				kg.Errf("Failed to destroy feeder: %v", err)
+			}
+		}
+	}()
 	// base feeder //
 
 	// node
@@ -252,6 +304,7 @@ func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
 
 	// default enforcer
 	fd.Enforcer = "eBPF Monitor"
+	fd.EnforcerLock = new(sync.RWMutex)
 
 	// initialize msg structs
 	fd.EventStructs = &EventStructs{
@@ -351,6 +404,11 @@ func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
 	fd.DefaultPostures = map[string]tp.DefaultPosture{}
 	fd.DefaultPosturesLock = new(sync.Mutex)
 
+	fd.UserNameMap = UserNameMap{
+		usernames: make(map[uint32]cachedUserName),
+		ttl:       10 * time.Minute,
+	}
+
 	return fd
 }
 
@@ -414,7 +472,7 @@ func (fd *Feeder) Print(message string) {
 }
 
 // Printf Function
-func (fd *Feeder) Printf(message string, args ...interface{}) {
+func (fd *Feeder) Printf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("INFO", str)
 	kg.Print(str)
@@ -427,7 +485,7 @@ func (fd *Feeder) Debug(message string) {
 }
 
 // Debugf Function
-func (fd *Feeder) Debugf(message string, args ...interface{}) {
+func (fd *Feeder) Debugf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("DEBUG", str)
 	kg.Debug(str)
@@ -440,7 +498,7 @@ func (fd *Feeder) Err(message string) {
 }
 
 // Errf Function
-func (fd *Feeder) Errf(message string, args ...interface{}) {
+func (fd *Feeder) Errf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("ERROR", str)
 	kg.Err(str)
@@ -453,7 +511,7 @@ func (fd *Feeder) Warn(message string) {
 }
 
 // Warnf Function
-func (fd *Feeder) Warnf(message string, args ...interface{}) {
+func (fd *Feeder) Warnf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("WARN", str)
 	kg.Warnf(str)
@@ -465,7 +523,9 @@ func (fd *Feeder) Warnf(message string, args ...interface{}) {
 
 // UpdateEnforcer Function
 func (fd *Feeder) UpdateEnforcer(enforcer string) {
+	fd.EnforcerLock.Lock()
 	fd.Enforcer = enforcer
+	fd.EnforcerLock.Unlock()
 }
 
 // =============== //
@@ -497,8 +557,8 @@ func (fd *Feeder) PushMessage(level, message string) {
 	pbMsg.Timestamp = timestamp
 	pbMsg.UpdatedTime = updatedTime
 
-	//pbMsg.ClusterName = cfg.GlobalCfg.Cluster
-	pbMsg.ClusterName = fd.Node.ClusterName
+	// pbMsg.ClusterName = cfg.GlobalCfg.Cluster
+	pbMsg.ClusterName = cfg.GlobalCfg.Cluster
 
 	pbMsg.HostName = cfg.GlobalCfg.Host
 	pbMsg.HostIP = fd.Node.NodeIP
@@ -519,7 +579,7 @@ func (fd *Feeder) PushMessage(level, message string) {
 		default:
 			counter++
 			if counter == lenMsg {
-				//Default on the last uid in Messagestruct means the msg isnt pushed into Broadcast
+				// Default on the last uid in Messagestruct means the msg isn't pushed into Broadcast
 				kg.Printf("msg channel busy, msg dropped")
 			}
 
@@ -527,32 +587,142 @@ func (fd *Feeder) PushMessage(level, message string) {
 	}
 }
 
+func MarshalVisibilityLog(log tp.Log) *pb.Log {
+	pbLog := pb.Log{}
+
+	pbLog.Timestamp = log.Timestamp
+	pbLog.UpdatedTime = log.UpdatedTime
+
+	pbLog.ClusterName = cfg.GlobalCfg.Cluster
+
+	pbLog.NamespaceName = log.NamespaceName
+
+	var owner *pb.Podowner
+	if log.Owner != nil && (log.Owner.Ref != "" || log.Owner.Name != "" || log.Owner.Namespace != "") {
+		owner = &pb.Podowner{
+			Ref:       log.Owner.Ref,
+			Name:      log.Owner.Name,
+			Namespace: log.Owner.Namespace,
+		}
+	}
+
+	if pbLog.Owner == nil && owner != nil {
+		pbLog.Owner = owner
+	}
+
+	pbLog.PodName = log.PodName
+	pbLog.Labels = log.Labels
+
+	pbLog.ContainerID = log.ContainerID
+	pbLog.ContainerName = log.ContainerName
+	pbLog.ContainerImage = log.ContainerImage
+
+	pbLog.HostPPID = log.HostPPID
+	pbLog.HostPID = log.HostPID
+
+	pbLog.PPID = log.PPID
+	pbLog.PID = log.PID
+	pbLog.UID = log.UID
+
+	pbLog.ParentProcessName = log.ParentProcessName
+	pbLog.ProcessName = log.ProcessName
+
+	pbLog.Type = log.Type
+	pbLog.TTY = log.TTY
+	pbLog.Source = log.Source
+	pbLog.Operation = log.Operation
+	if !(pbLog.Operation == "Process" && cfg.GlobalCfg.DropResourceFromProcessLogs) {
+		pbLog.Resource = strings.ToValidUTF8(log.Resource, "")
+	}
+	pbLog.Cwd = log.Cwd
+
+	pbLog.ExecEvent = &pb.ExecEvent{
+		ExecID:         log.ExecEvent.ExecID,
+		ExecutableName: log.ExecEvent.ExecutableName,
+	}
+
+	if len(log.Data) > 0 {
+		pbLog.Data = log.Data
+	}
+	if log.EventData != nil {
+		pbLog.EventData = log.EventData
+	}
+	pbLog.ProcessHash = log.ProcessHash[:]
+	pbLog.ParentHash = log.ParentHash[:]
+	pbLog.ResourceHash = log.ResourceHash[:]
+	if len(log.HashAlgo) > 0 {
+		pbLog.HashAlgo = log.HashAlgo
+	}
+
+	pbLog.Result = log.Result
+	return &pbLog
+}
+
 // PushLog Function
 func (fd *Feeder) PushLog(log tp.Log) {
+	// Safety net: recover from any 'send on closed channel' panics that may
+	// occur due to a race window between RemoveLogStruct and PushLog.
+	defer func() {
+		if r := recover(); r != nil {
+			kg.Printf("PushLog: recovered from panic (send on closed channel during client disconnect): %v", r)
+		}
+	}()
+
 	/* if enforcer == BPFLSM and log.Enforcer == ebpfmonitor ( block and default Posture Alerts from System
 	   monitor are converted to host/container logs)
 	   in case of enforcer = AppArmor only Default Posture logs will be converted to
 	   container/host log depending upon the defaultPostureLogs flag
 	*/
-	if (cfg.GlobalCfg.EnforcerAlerts && fd.Enforcer == "BPFLSM" && log.Enforcer != "BPFLSM") || (fd.Enforcer != "BPFLSM" && !cfg.GlobalCfg.DefaultPostureLogs) {
-		log = fd.UpdateMatchedPolicy(log)
-		if (log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy") && ((fd.Enforcer == "BPFLSM" && (strings.Contains(log.PolicyName, "DefaultPosture") || !strings.Contains(log.Action, "Audit"))) || (fd.Enforcer != "BPFLSM" && strings.Contains(log.PolicyName, "DefaultPosture"))) {
-			if log.Type == "MatchedPolicy" {
-				log.Type = "ContainerLog"
-			} else if log.Type == "MatchedHostPolicy" {
-				log.Type = "HostLog"
+	isBPFLSM := fd.GetEnforcer() == "BPFLSM"
+	if !common.IsPresetEnforcer(log.Enforcer) {
+		if (cfg.GlobalCfg.EnforcerAlerts && isBPFLSM && log.Enforcer == "") || (!isBPFLSM && !cfg.GlobalCfg.DefaultPostureLogs) {
+			log = fd.UpdateMatchedPolicy(log)
+			isDefaultPostureLog := strings.Contains(log.PolicyName, "DefaultPosture")
+			isAudit := strings.Contains(log.Action, "Audit")
+			if (log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy") && ((isBPFLSM && (isDefaultPostureLog || !isAudit)) || (!isBPFLSM && isDefaultPostureLog)) {
+				switch log.Type {
+				case "MatchedPolicy":
+					log.Type = "ContainerLog"
+				case "MatchedHostPolicy":
+					log.Type = "HostLog"
+				}
+			}
+		} else {
+			log = fd.UpdateMatchedPolicy(log)
+			if isBPFLSM {
+				log.Enforcer = "BPFLSM"
 			}
 		}
-	} else {
-		log = fd.UpdateMatchedPolicy(log)
-		if fd.Enforcer == "BPFLSM" {
-			log.Enforcer = "BPFLSM"
+	}
+
+	// change enforcer and format log Resource
+	if log.Operation == "Device" {
+		log.Enforcer = "USBDeviceHandler"
+
+		parts := strings.SplitN(log.Resource, " ", 2) // ["USB", "MASS-STORAGE_6_80"]
+		classPart := strings.SplitN(parts[1], "_", 2)[0]
+		log.Resource = parts[0] + " " + classPart
+	}
+
+	if log.Operation == "NetworkFirewall" {
+		log.Enforcer = "NetworkPolicyEnforcer"
+
+		parts := strings.Split(log.Resource, " ") // policyName chain(INPUT/OUTPUT) action(Audit/Block)
+		direction := "INGRESS"
+		if len(parts) > 2 {
+			if parts[1] == "OUTPUT" || strings.ToUpper(parts[1]) == "EGRESS" {
+				direction = "EGRESS"
+			}
 		}
+		log.Resource = direction
 	}
 
 	if log.Source == "" {
 		// even if a log doesn't have a source, it must have a type
 		if log.Type == "" {
+			if strings.Contains(log.Enforcer, "PRESET") {
+				kg.Printf("no source and type: %s\n", log.Enforcer)
+			}
 			return
 		}
 		fd.Debug("Pushing Telemetry without source")
@@ -561,12 +731,36 @@ func (fd *Feeder) PushLog(log tp.Log) {
 	// set hostname
 	log.HostName = cfg.GlobalCfg.Host
 
+	// populate EventData by merging structured data from Data and Resource
+	var mergedEventData map[string]string
+	if len(log.Data) > 0 {
+		mergedEventData = parseDataString(log.Data)
+	}
+	// populate Resource data only for Network operations
+	if len(log.Resource) > 0 && log.Operation == "Network" {
+		if mergedEventData == nil {
+			mergedEventData = parseDataString(log.Resource)
+		} else {
+			for k, v := range parseDataString(log.Resource) {
+				mergedEventData[k] = v
+			}
+		}
+	}
+	if mergedEventData != nil {
+		log.EventData = mergedEventData
+	}
+
 	// remove flags
 	log.PolicyEnabled = 0
 	log.ProcessVisibilityEnabled = false
 	log.FileVisibilityEnabled = false
 	log.NetworkVisibilityEnabled = false
 	log.CapabilitiesVisibilityEnabled = false
+
+	if log.Type == "MatchedHostPolicy" || log.Type == "HostLog" {
+		// getting username is supported for host alerts only due to performance overhead
+		log.UserName = fd.UserNameMap.GetUsername(uint32(log.UID))
+	}
 
 	// standard output / file output
 	if fd.Output == "stdout" {
@@ -579,13 +773,32 @@ func (fd *Feeder) PushLog(log tp.Log) {
 
 	// gRPC output
 	if log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy" || log.Type == "SystemEvent" {
+
+		// checking throttling condition for "Audit" alerts when enforcer is 'eBPF Monitor'
+		if cfg.GlobalCfg.AlertThrottling && ((strings.Contains(log.Action, "Audit") && log.Enforcer == "eBPF Monitor") || (log.Type == "MatchedHostPolicy" && (log.Enforcer == "AppArmor" || log.Enforcer == "eBPF Monitor"))) {
+			nsKey := fd.ContainerNsKey[log.ContainerID]
+			alert, throttle := fd.ShouldDropAlertsPerContainer(nsKey.PidNs, nsKey.MntNs)
+			if alert && throttle {
+				return
+			} else if alert && !throttle {
+				log.Operation = "AlertThreshold"
+				log.Type = "SystemEvent"
+				log.MaxAlertsPerSec = cfg.GlobalCfg.MaxAlertPerSec
+				log.DroppingAlertsInterval = cfg.GlobalCfg.ThrottleSec
+			}
+		}
 		pbAlert := pb.Alert{}
+
+		node := fd.GetNodeInfo()
+
+		pbAlert.KubeArmorVersion = log.KubeArmorVersion
 
 		pbAlert.Timestamp = log.Timestamp
 		pbAlert.UpdatedTime = log.UpdatedTime
 
-		pbAlert.ClusterName = fd.Node.ClusterName
-		pbAlert.HostName = fd.Node.NodeName
+		pbAlert.ClusterName = cfg.GlobalCfg.Cluster
+		pbAlert.HostName = node.NodeName
+		pbAlert.NodeID = node.NodeID
 
 		pbAlert.NamespaceName = log.NamespaceName
 
@@ -627,7 +840,7 @@ func (fd *Feeder) PushLog(log tp.Log) {
 			pbAlert.PolicyName = log.PolicyName
 		}
 
-		if len(log.Severity) > 0 {
+		if len(log.Severity) > 0 && log.Severity != "0" {
 			pbAlert.Severity = log.Severity
 		}
 
@@ -647,101 +860,76 @@ func (fd *Feeder) PushLog(log tp.Log) {
 		pbAlert.Resource = strings.ToValidUTF8(log.Resource, "")
 		pbAlert.Cwd = log.Cwd
 
+		pbAlert.ExecEvent = &pb.ExecEvent{
+			ExecID:         log.ExecEvent.ExecID,
+			ExecutableName: log.ExecEvent.ExecutableName,
+		}
+
 		if len(log.Data) > 0 {
 			pbAlert.Data = log.Data
+		}
+		if log.EventData != nil {
+			pbAlert.EventData = log.EventData
+		}
+		pbAlert.ProcessHash = log.ProcessHash[:]
+		pbAlert.ParentHash = log.ParentHash[:]
+		pbAlert.ResourceHash = log.ResourceHash[:]
+		if len(log.HashAlgo) > 0 {
+			pbAlert.HashAlgo = log.HashAlgo
 		}
 
 		if len(log.Action) > 0 {
 			pbAlert.Action = log.Action
 		}
 
+		if log.Operation == "NetworkFirewall" {
+			pbAlert.Type = "MatchedNetworkPolicy"
+		}
+
 		pbAlert.Result = log.Result
 		pbAlert.MaxAlertsPerSec = log.MaxAlertsPerSec
 		pbAlert.DroppingAlertsInterval = log.DroppingAlertsInterval
+
+		pbAlert.UserName = log.UserName
 
 		fd.EventStructs.AlertLock.Lock()
 		defer fd.EventStructs.AlertLock.Unlock()
 		counter := 0
 		lenAlert := len(fd.EventStructs.AlertStructs)
-
 		for uid := range fd.EventStructs.AlertStructs {
 			select {
 			case fd.EventStructs.AlertStructs[uid].Broadcast <- &pbAlert:
 			default:
 				counter++
 				if counter == lenAlert {
-					//Default on the last uid in Alterstruct means the Alert isnt pushed into Broadcast
+					// Default on the last uid in Alterstruct means the Alert isn't pushed into Broadcast
 					kg.Printf("log channel busy, alert dropped.")
 				}
 
 			}
 		}
 	} else { // ContainerLog || HostLog
-		pbLog := pb.Log{}
-
-		pbLog.Timestamp = log.Timestamp
-		pbLog.UpdatedTime = log.UpdatedTime
-
-		pbLog.ClusterName = fd.Node.ClusterName
-		pbLog.HostName = fd.Node.NodeName
-
-		pbLog.NamespaceName = log.NamespaceName
-
-		var owner *pb.Podowner
-		if log.Owner != nil && (log.Owner.Ref != "" || log.Owner.Name != "" || log.Owner.Namespace != "") {
-			owner = &pb.Podowner{
-				Ref:       log.Owner.Ref,
-				Name:      log.Owner.Name,
-				Namespace: log.Owner.Namespace,
-			}
-		}
-
-		if pbLog.Owner == nil && owner != nil {
-			pbLog.Owner = owner
-		}
-
-		pbLog.PodName = log.PodName
-		pbLog.Labels = log.Labels
-
-		pbLog.ContainerID = log.ContainerID
-		pbLog.ContainerName = log.ContainerName
-		pbLog.ContainerImage = log.ContainerImage
-
-		pbLog.HostPPID = log.HostPPID
-		pbLog.HostPID = log.HostPID
-
-		pbLog.PPID = log.PPID
-		pbLog.PID = log.PID
-		pbLog.UID = log.UID
-
-		pbLog.ParentProcessName = log.ParentProcessName
-		pbLog.ProcessName = log.ProcessName
-
-		pbLog.Type = log.Type
-		pbLog.TTY = log.TTY
-		pbLog.Source = log.Source
-		pbLog.Operation = log.Operation
-		pbLog.Resource = strings.ToValidUTF8(log.Resource, "")
-		pbLog.Cwd = log.Cwd
-
-		if len(log.Data) > 0 {
-			pbLog.Data = log.Data
-		}
-
-		pbLog.Result = log.Result
-
+		node := fd.GetNodeInfo()
+		pbLog := MarshalVisibilityLog(log)
+		pbLog.HostName = node.NodeName
+		pbLog.NodeID = node.NodeID
+		pbLog.UserName = log.UserName
 		fd.EventStructs.LogLock.Lock()
 		defer fd.EventStructs.LogLock.Unlock()
 		counter := 0
 		lenlog := len(fd.EventStructs.LogStructs)
 		for uid := range fd.EventStructs.LogStructs {
 			select {
-			case fd.EventStructs.LogStructs[uid].Broadcast <- &pbLog:
+			case fd.EventStructs.LogStructs[uid].Broadcast <- pbLog:
 			default:
 				counter++
 				if counter == lenlog {
-					//Default on the last uid in Logstuct means the log isnt pushed into Broadcase
-					kg.Printf("log channel busy, log dropped.")
+					// Default on the last uid in Logstuct means the log isn't pushed into Broadcast
+					fd.DroppedLogs++
+					if fd.DroppedLogs%10000 == 0 {
+						kg.Warnf("log channel busy, 10000 logs dropped.")
+						fd.DroppedLogs = 0
+					}
 				}
 			}
 		}
@@ -752,7 +940,7 @@ func loadTLSCredentials(ip string) (credentials.TransportCredentials, error) {
 	// create certificate configurations
 	serverCertConfig := cert.DefaultKubeArmorServerConfig
 	serverCertConfig.IPs = []string{ip}
-	serverCertConfig.NotAfter = time.Now().Add(365 * 24 * time.Hour) //valid for 1 year
+	serverCertConfig.NotAfter = time.Now().Add(365 * 24 * time.Hour) // valid for 1 year
 	// as of now daemonset creates certificates dynamically
 	tlsConfig := cert.TlsConfig{
 		CertCfg:      serverCertConfig,
@@ -770,6 +958,9 @@ func (fd *Feeder) ShouldDropAlertsPerContainer(pidNs, mntNs uint32) (bool, bool)
 		PidNs: pidNs,
 		MntNs: mntNs,
 	}
+
+	fd.AlertMapLock.Lock()
+	defer fd.AlertMapLock.Unlock()
 
 	if fd.AlertMap == nil {
 		fd.AlertMap = make(map[OuterKey]AlertThrottleState)
@@ -819,5 +1010,55 @@ func (fd *Feeder) ShouldDropAlertsPerContainer(pidNs, mntNs uint32) (bool, bool)
 }
 
 func (fd *Feeder) DeleteAlertMapKey(outkey kl.OuterKey) {
+	fd.AlertMapLock.Lock()
+	defer fd.AlertMapLock.Unlock()
 	delete(fd.AlertMap, OuterKey{PidNs: outkey.PidNs, MntNs: outkey.MntNs})
+}
+
+func (fd *Feeder) GetEnforcer() string {
+	fd.EnforcerLock.RLock()
+	val := fd.Enforcer
+	fd.EnforcerLock.RUnlock()
+	return val
+}
+
+func (fd *Feeder) GetNodeInfo() tp.Node {
+	lock := *fd.NodeLock
+	lock.RLock()
+	defer lock.RUnlock()
+
+	node := *fd.Node
+	return node
+}
+
+func (uname *UserNameMap) GetUsername(uid uint32) string {
+	uname.mu.RLock()
+	entry, exists := uname.usernames[uid]
+	uname.mu.RUnlock()
+
+	// If it exists and hasn't expired, return cached value
+	if exists && time.Now().Before(entry.ExpiresAt) {
+		return entry.Username
+	}
+
+	// Entry is missing or expired. Add it to map.
+	uidStr := strconv.FormatUint(uint64(uid), 10)
+	u, err := user.LookupId(uidStr)
+
+	name := ""
+	if err != nil {
+		// notfound
+		name = ""
+	} else {
+		name = u.Username
+	}
+
+	// Update cache
+	uname.mu.Lock()
+	uname.usernames[uid] = cachedUserName{
+		Username:  name,
+		ExpiresAt: time.Now().Add(uname.ttl),
+	}
+	uname.mu.Unlock()
+	return name
 }
